@@ -574,11 +574,14 @@ fn a_picture_is_previewed_with_coloured_half_blocks() {
     s.wait_for_text("apps/");
     s.send("fa");
     let rows = s.wait_for_text("image/png");
-    let card = rows.iter().position(|r| r.contains("image/png")).unwrap();
-    let row = (card - 2) as u16;
-    let colours: Vec<_> = (0..common::COLS)
-        .map(|x| s.fg(row, x))
-        .filter(|c| matches!(c, vt100::Color::Rgb(..)))
+    let brace = rows
+        .iter()
+        .find_map(|r| r.chars().position(|c| c == '┤'))
+        .unwrap() as u16;
+    let colours: Vec<_> = (0..common::ROWS)
+        .flat_map(|row| (brace + 2..common::COLS).map(move |x| (row, x)))
+        .map(|(row, x)| s.bg(row, x))
+        .filter(|c| matches!(c, vt100::Color::Rgb(r, g, b) if (*r, *g, *b) != (0x0d, 0x11, 0x17)))
         .collect();
     assert!(colours.len() > 10, "the picture is drawn: {rows:#?}");
 }

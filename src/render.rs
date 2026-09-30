@@ -19,6 +19,8 @@ use crate::{
 const MIN_WIDTH: u16 = 16;
 const MAX_WIDTH: u16 = 40;
 const META_WIDTH: u16 = 6;
+/// Blank cells between a picture and the info lines beside it.
+const PANEL_GAP: u16 = 2;
 const WARN: (u8, u8, u8) = (0xff, 0x9e, 0x64);
 /// A listing faster than this never flashes a loading label.
 const LOADING_LABEL_DELAY: Duration = Duration::from_millis(120);
@@ -366,7 +368,8 @@ struct PictureLayout {
     rows: usize,
 }
 
-/// Fits the picture into a column, leaving room under it for the info lines.
+/// Fits the picture into a column with its info lines beside it or under it, whichever leaves the
+/// picture more cells, and beside it when both do the same.
 fn picture_layout(
     content: &Content,
     painter: &Painter,
@@ -374,16 +377,46 @@ fn picture_layout(
     height: u16,
 ) -> Option<PictureLayout> {
     let image = content.image.as_ref()?;
-    let room = height.saturating_sub(content.lines.len() as u16 + 1);
-    let picture = painter.fitted_size(
-        image,
-        ratatui::layout::Size::new(width.saturating_sub(1), room),
-    )?;
-    Some(PictureLayout {
-        picture,
-        info: (0, picture.height + 1),
-        rows: usize::from(picture.height) + 1 + content.lines.len(),
-    })
+    let lines = content.lines.len();
+    let room = width.saturating_sub(1);
+    let below = painter
+        .fitted_size(
+            image,
+            ratatui::layout::Size::new(room, height.saturating_sub(lines as u16 + 1)),
+        )
+        .map(|picture| PictureLayout {
+            picture,
+            info: (0, picture.height + 1),
+            rows: usize::from(picture.height) + 1 + lines,
+        });
+    let panel = content
+        .lines
+        .iter()
+        .map(|l| l.text().width())
+        .max()
+        .unwrap_or(0) as u16
+        + PANEL_GAP;
+    let beside = (usize::from(height) >= lines)
+        .then(|| {
+            painter.fitted_size(
+                image,
+                ratatui::layout::Size::new(room.checked_sub(panel)?, height),
+            )
+        })
+        .flatten()
+        .map(|picture| PictureLayout {
+            picture,
+            info: (
+                picture.width + PANEL_GAP,
+                picture.height.saturating_sub(lines as u16) / 2,
+            ),
+            rows: usize::from(picture.height).max(lines),
+        });
+    let cells = |l: &PictureLayout| l.picture.width * l.picture.height;
+    match (below, beside) {
+        (Some(below), Some(beside)) if cells(&beside) >= cells(&below) => Some(beside),
+        (below, beside) => below.or(beside),
+    }
 }
 
 fn gutter_width(content: &Content) -> u16 {
@@ -1473,12 +1506,13 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         write_png(&tmp.path().join("photo.png"), 200, 100);
         let app = open(tmp.path());
-        let (lines, buf) = rows(&app, 100, 30);
+        // Too narrow for the card to fit beside the picture.
+        let (lines, buf) = rows(&app, 60, 30);
         let card = row_of(&lines, "image/png");
         assert!(lines[card].contains("200×100"), "{lines:#?}");
         let tip = row_of(&lines, "─┤");
         let brace_x = lines[tip].chars().position(|c| c == '┤').unwrap() as u16;
-        let reds_and_blues: Vec<_> = (brace_x + 3..100)
+        let reds_and_blues: Vec<_> = (brace_x + 3..60)
             .map(|x| buf[(x, (card - 2) as u16)].fg)
             .filter(|c| *c != theme::rgb(BG) && *c != ratatui::style::Color::Reset)
             .collect();
@@ -1490,6 +1524,33 @@ mod tests {
             reds_and_blues.first(),
             reds_and_blues.last(),
             "red on the left, blue on the right"
+        );
+    }
+
+    #[test]
+    fn a_tall_picture_in_a_wide_column_has_its_card_beside_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_png(&tmp.path().join("photo.png"), 100, 300);
+        let app = open(tmp.path());
+        let (lines, buf) = rows(&app, 140, 30);
+        let card = row_of(&lines, "image/png");
+        let tip = row_of(&lines, "─┤");
+        let brace_x = lines[tip].chars().position(|c| c == '┤').unwrap() as u16;
+        let card_x = lines[card][..lines[card].find("type").unwrap()]
+            .chars()
+            .count() as u16;
+        let picture: Vec<_> = (brace_x + 3..card_x)
+            .map(|x| buf[(x, card as u16)].fg)
+            .filter(|c| *c != theme::rgb(BG) && *c != ratatui::style::Color::Reset)
+            .collect();
+        assert!(
+            picture.len() > 3,
+            "the picture fills the row to the left of the card: {lines:#?}"
+        );
+        let histogram = row_of(&lines, "█");
+        assert!(
+            lines[histogram].find('█').unwrap() > lines[histogram].find('▀').unwrap_or(0),
+            "the histogram sits beside the picture too: {lines:#?}"
         );
     }
 
