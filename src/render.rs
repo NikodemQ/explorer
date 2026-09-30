@@ -349,27 +349,41 @@ fn preview_color(preview: &FilePreview) -> (u8, u8, u8) {
 
 fn preview_lines(preview: &FilePreview, painter: &Painter, width: u16, height: u16) -> usize {
     match &preview.state {
-        PreviewState::Ready(content) => match image_size(content, painter, width, height) {
-            Some(size) => usize::from(size.height) + 1 + content.lines.len(),
+        PreviewState::Ready(content) => match picture_layout(content, painter, width, height) {
+            Some(layout) => layout.rows,
             None => content.lines.len().max(1),
         },
         _ => 1,
     }
 }
 
-/// Cells a preview's picture takes in a column, leaving room under it for the info lines.
-fn image_size(
+/// Where a preview's picture and its info lines sit in a column.
+struct PictureLayout {
+    picture: ratatui::layout::Size,
+    /// Where the info lines start, relative to the picture's top left corner.
+    info: (u16, u16),
+    /// Rows the picture and its info take together.
+    rows: usize,
+}
+
+/// Fits the picture into a column, leaving room under it for the info lines.
+fn picture_layout(
     content: &Content,
     painter: &Painter,
     width: u16,
     height: u16,
-) -> Option<ratatui::layout::Size> {
+) -> Option<PictureLayout> {
     let image = content.image.as_ref()?;
     let room = height.saturating_sub(content.lines.len() as u16 + 1);
-    painter.fitted_size(
+    let picture = painter.fitted_size(
         image,
         ratatui::layout::Size::new(width.saturating_sub(1), room),
-    )
+    )?;
+    Some(PictureLayout {
+        picture,
+        info: (0, picture.height + 1),
+        rows: usize::from(picture.height) + 1 + content.lines.len(),
+    })
 }
 
 fn gutter_width(content: &Content) -> u16 {
@@ -408,20 +422,19 @@ fn draw_preview(
         }
         PreviewState::Ready(content) => content,
     };
-    if let (Some(image), Some(size)) = (
+    if let (Some(image), Some(fit)) = (
         &content.image,
-        image_size(content, painter, p.width, tree.height),
+        picture_layout(content, painter, p.width, tree.height),
     ) {
-        let total = usize::from(size.height) + 1 + content.lines.len();
-        let (top, _) = layout::block_rows(tree.height, center, total);
-        let area = Rect::new(x + 1, tree.y + top, size.width, size.height);
+        let (top, _) = layout::block_rows(tree.height, center, fit.rows);
+        let area = Rect::new(x + 1, tree.y + top, fit.picture.width, fit.picture.height);
         painter.draw(&preview.path, image, area, buf);
         for (i, line) in content.lines.iter().enumerate() {
-            let y = tree.y + top + size.height + 1 + i as u16;
+            let y = tree.y + top + fit.info.1 + i as u16;
             if y >= tree.bottom() {
                 break;
             }
-            let mut cx = x + 1;
+            let mut cx = x + 1 + fit.info.0;
             for span in &line.0 {
                 let end = x + p.width;
                 if cx >= end {
