@@ -13,11 +13,16 @@ fn center(rows: &[String]) -> &str {
 }
 
 #[test]
-fn starts_on_the_first_entry_flush_left_with_the_preview_and_brace() {
+fn starts_on_the_first_entry_beside_its_parent_with_the_preview_and_brace() {
     let tmp = fixture();
     let s = Session::spawn(tmp.path());
     let rows = s.wait_for_text("apps/");
-    assert!(center(&rows).starts_with(" apps/"), "{:?}", center(&rows));
+    assert!(
+        center(&rows).starts_with(" root/"),
+        "the parent is listed on the left: {:?}",
+        center(&rows)
+    );
+    assert!(center(&rows).contains("apps/"), "{:?}", center(&rows));
     assert!(center(&rows).contains("─┬─"), "{:?}", center(&rows));
     assert!(rows.iter().any(|r| r.contains("web/")), "{rows:#?}");
 }
@@ -29,7 +34,7 @@ fn vim_counts_and_jumps_move_the_cursor_row() {
     s.wait_for_text("apps/");
     s.send("2j");
     let rows = s.wait("cursor on zeta", |r| center(r).contains("zeta/"));
-    assert!(center(&rows).starts_with(" zeta/"));
+    assert!(center(&rows).starts_with(" root/"), "{:?}", center(&rows));
     s.send("gg");
     s.wait("cursor back on apps", |r| center(r).contains("apps/"));
     s.send("G");
@@ -440,11 +445,9 @@ fn a_selection_made_with_space_survives_moving_around() {
     let mut s = Session::spawn(tmp.path());
     s.wait_for_text("apps/");
     s.send(" ");
-    s.wait("marker appears", |r| r.iter().any(|x| x.starts_with('●')));
+    s.wait("marker appears", |r| r.iter().any(|x| x.contains("●apps/")));
     s.send("jj");
-    s.wait("marker stays", |r| {
-        r.iter().any(|x| x.starts_with('●') && x.contains("apps/"))
-    });
+    s.wait("marker stays", |r| r.iter().any(|x| x.contains("●apps/")));
     s.send("dd");
     s.wait("selected entry deleted", |r| {
         !r.iter().any(|x| x.contains("apps/"))

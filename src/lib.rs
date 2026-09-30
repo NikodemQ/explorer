@@ -24,5 +24,7 @@ pub mod save;
 pub mod search;
 pub mod shell;
 pub mod termquery;
+#[cfg(test)]
+mod testdir;
 pub mod textbuf;
 pub mod theme;

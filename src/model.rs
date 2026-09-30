@@ -199,6 +199,7 @@ impl Tree {
             notice: None,
         };
         tree.push_level(Level::pending(root, 0, show_hidden));
+        tree.sync_preview();
         tree
     }
 
@@ -260,6 +261,13 @@ impl Tree {
     }
 
     fn advance_reveal(&mut self) {
+        self.walk_reveal();
+        if self.focus == 0 && self.reveal.is_empty() {
+            self.insert_parent();
+        }
+    }
+
+    fn walk_reveal(&mut self) {
         while let Some(name) = self.reveal.front().cloned() {
             let level = &mut self.levels[self.focus];
             match level.load {
@@ -451,11 +459,18 @@ impl Tree {
     }
 
     pub fn leave(&mut self) {
+        if self.focus == 0 {
+            self.insert_parent();
+        }
         if self.focus > 0 {
             self.focus -= 1;
             self.sync_preview();
-            return;
         }
+    }
+
+    /// Lists the directory above the top level, with its cursor on the child, and keeps the focus
+    /// where it was. The old levels stay behind the parent until it loads; `sync_preview` then reuses them.
+    fn insert_parent(&mut self) {
         let child = self.levels[0].dir.clone();
         let (Some(parent), Some(name)) = (child.parent(), child.file_name()) else {
             return;
@@ -463,9 +478,9 @@ impl Tree {
         let mut level = Level::pending(parent.to_path_buf(), 0, self.show_hidden);
         level.keep = Some(name.to_os_string());
         level.anchor = Some(name.to_os_string());
-        // The old levels stay behind the parent until it loads; `sync_preview` then reuses them.
         self.requests.push(level.request());
         self.levels.insert(0, level);
+        self.focus += 1;
     }
 
     fn push_level(&mut self, level: Level) {
@@ -473,8 +488,17 @@ impl Tree {
         self.levels.push(level);
     }
 
-    /// Makes the level after `focus` match the directory under the cursor, reusing it when it already does.
+    /// Keeps the focus between its parent and the level after it: the parent is listed whenever
+    /// the focus reaches the top, except while a reveal is still walking down from there.
     fn sync_preview(&mut self) {
+        self.sync_child();
+        if self.focus == 0 && self.reveal.is_empty() {
+            self.insert_parent();
+        }
+    }
+
+    /// Makes the level after `focus` match the directory under the cursor, reusing it when it already does.
+    fn sync_child(&mut self) {
         let level = &self.levels[self.focus];
         let file = level
             .selected()
@@ -541,8 +565,9 @@ impl Tree {
     }
 
     /// After level `i` changed, drop the levels to its right that no longer follow from its cursor.
+    /// A level that could not be listed says nothing about them, so they stay.
     fn reconcile(&mut self, i: usize) {
-        if i < self.focus {
+        if i < self.focus && matches!(self.levels[i].load, Load::Ready) {
             let level = &self.levels[i];
             let follows = level
                 .selected()
@@ -581,8 +606,8 @@ mod tests {
 
     use super::*;
 
-    fn fixture() -> tempfile::TempDir {
-        let tmp = tempfile::tempdir().unwrap();
+    fn fixture() -> crate::testdir::TestDir {
+        let tmp = crate::testdir::tempdir();
         let r = tmp.path();
         fs::create_dir_all(r.join("alpha/inner")).unwrap();
         fs::create_dir_all(r.join("beta")).unwrap();
@@ -613,18 +638,18 @@ mod tests {
     fn lists_dirs_first_and_hides_dotfiles() {
         let tmp = fixture();
         let tree = open(tmp.path());
-        assert_eq!(names(&tree.levels()[0]), ["alpha", "beta", "file.md"]);
+        assert_eq!(names(&tree.levels()[1]), ["alpha", "beta", "file.md"]);
     }
 
     #[test]
     fn preview_follows_cursor_and_vanishes_on_files() {
         let tmp = fixture();
         let mut tree = open(tmp.path());
-        assert_eq!(names(&tree.levels()[1]), ["inner", "one.txt", "two.txt"]);
+        assert_eq!(names(&tree.levels()[2]), ["inner", "one.txt", "two.txt"]);
         step(&mut tree, |t| t.move_by(1));
-        assert_eq!(tree.levels()[1].dir, tmp.path().join("beta"));
+        assert_eq!(tree.levels()[2].dir, tmp.path().join("beta"));
         step(&mut tree, |t| t.move_by(1));
-        assert_eq!(tree.levels().len(), 1);
+        assert_eq!(tree.levels().len(), 2);
     }
 
     #[test]
@@ -632,24 +657,39 @@ mod tests {
         let tmp = fixture();
         let mut tree = open(tmp.path());
         step(&mut tree, |t| t.enter());
-        assert_eq!(tree.focus(), 1);
+        assert_eq!(tree.focus(), 2);
         step(&mut tree, |t| t.move_by(2));
         step(&mut tree, |t| t.leave());
-        assert_eq!(tree.focus(), 0);
+        assert_eq!(tree.focus(), 1);
         step(&mut tree, |t| t.enter());
-        assert_eq!(tree.levels()[1].cursor, 2);
+        assert_eq!(tree.levels()[2].cursor, 2);
     }
 
     #[test]
-    fn leave_at_root_loads_the_parent_with_cursor_on_the_child() {
+    fn leaving_the_top_level_lists_the_one_above_it_and_keeps_the_focus_in_the_middle() {
         let tmp = fixture();
         let mut tree = open(&tmp.path().join("alpha"));
         step(&mut tree, |t| t.move_by(1));
+        assert_eq!(
+            tree.focus(),
+            1,
+            "the start is between its parent and its child"
+        );
         step(&mut tree, |t| t.leave());
-        assert_eq!(tree.levels()[0].dir, tmp.path());
-        assert_eq!(tree.levels()[0].selected().unwrap().display_name(), "alpha");
-        assert_eq!(tree.levels()[1].dir, tmp.path().join("alpha"));
-        assert_eq!(tree.levels().len(), 2);
+        assert_eq!(
+            tree.focus(),
+            1,
+            "the focus stays in the middle, not on the leftmost column"
+        );
+        assert_eq!(
+            tree.levels()[0].dir,
+            tmp.path().parent().unwrap(),
+            "the level above the new focus is listed too"
+        );
+        assert_eq!(tree.levels()[1].dir, tmp.path());
+        assert_eq!(tree.levels()[1].selected().unwrap().display_name(), "alpha");
+        assert_eq!(tree.levels()[2].dir, tmp.path().join("alpha"));
+        assert_eq!(tree.levels().len(), 3);
     }
 
     #[test]
@@ -658,7 +698,7 @@ mod tests {
         fs::create_dir_all(tmp.path().join(".dot/sub")).unwrap();
         let mut tree = open(&tmp.path().join(".dot"));
         step(&mut tree, |t| t.leave());
-        assert_eq!(tree.levels()[0].selected().unwrap().display_name(), ".dot");
+        assert_eq!(tree.levels()[1].selected().unwrap().display_name(), ".dot");
     }
 
     #[test]
@@ -675,11 +715,31 @@ mod tests {
     fn unreadable_directory_becomes_a_failed_level() {
         let mut tree = open(Path::new("/definitely/not/here"));
         assert!(matches!(
-            tree.levels()[0].load,
+            tree.levels()[1].load,
             Load::Failed(io::ErrorKind::NotFound)
         ));
-        assert!(tree.levels()[0].entries.is_empty());
+        assert!(tree.levels()[1].entries.is_empty());
+        assert_eq!(tree.levels()[1].dir, Path::new("/definitely/not/here"));
         assert_eq!(step(&mut tree, |t| t.enter()), None);
+    }
+
+    #[test]
+    fn an_unreadable_parent_keeps_the_directory_below_it() {
+        let tmp = fixture();
+        let mut tree = Tree::new(tmp.path().to_path_buf(), false);
+        let parent = tmp.path().parent().unwrap().to_path_buf();
+        for r in tree.take_requests() {
+            let result = if r.dir == parent {
+                Err(io::Error::from(io::ErrorKind::PermissionDenied))
+            } else {
+                crate::fsread::read_dir(&r.dir, r.keep.as_deref(), r.hidden)
+            };
+            tree.finish_load(&r.dir, result);
+        }
+        tree.settle();
+        assert_eq!(tree.focus(), 1);
+        assert_eq!(tree.focused().dir, tmp.path());
+        assert_eq!(names(tree.focused()), ["alpha", "beta", "file.md"]);
     }
 
     #[test]
@@ -691,7 +751,7 @@ mod tests {
             step(&mut tree, |t| t.enter()),
             Some(Effect::Open(tmp.path().join("file.md")))
         );
-        assert_eq!(tree.focus(), 0);
+        assert_eq!(tree.focus(), 1);
     }
 
     #[test]
@@ -699,9 +759,13 @@ mod tests {
         let tmp = fixture();
         let mut tree = Tree::new(tmp.path().to_path_buf(), false);
         assert!(tree.is_loading());
-        assert!(tree.levels()[0].entries.is_empty());
+        assert!(tree.levels()[1].entries.is_empty());
         tree.move_by(1);
-        assert_eq!(tree.take_requests().len(), 1);
+        assert_eq!(
+            tree.take_requests().len(),
+            2,
+            "the directory and its parent, and nothing waited for"
+        );
     }
 
     #[test]
@@ -711,8 +775,8 @@ mod tests {
         step(&mut tree, |t| t.move_by(1));
         let stale = tmp.path().join("alpha");
         tree.finish_load(&stale, Ok(Vec::new()));
-        assert_eq!(tree.levels().len(), 2);
-        assert_eq!(tree.levels()[1].dir, tmp.path().join("beta"));
+        assert_eq!(tree.levels().len(), 3);
+        assert_eq!(tree.levels()[2].dir, tmp.path().join("beta"));
     }
 
     #[test]
@@ -723,7 +787,7 @@ mod tests {
         fs::create_dir(tmp.path().join("aaa")).unwrap();
         tree.reload(tmp.path());
         tree.settle();
-        let level = &tree.levels()[0];
+        let level = &tree.levels()[1];
         assert_eq!(level.selected().unwrap().display_name(), "beta");
         assert_eq!(level.cursor, 2);
     }
@@ -735,7 +799,7 @@ mod tests {
         fs::write(tmp.path().join("alpha/new.txt"), "").unwrap();
         tree.reload(&tmp.path().join("alpha"));
         tree.settle();
-        assert!(names(&tree.levels()[1]).contains(&"new.txt".to_string()));
+        assert!(names(&tree.levels()[2]).contains(&"new.txt".to_string()));
     }
 
     #[test]
@@ -746,9 +810,9 @@ mod tests {
         fs::remove_dir_all(tmp.path().join("alpha")).unwrap();
         tree.reload(tmp.path());
         tree.settle();
-        assert_eq!(tree.focus(), 0);
-        assert_eq!(tree.levels()[0].selected().unwrap().display_name(), "beta");
-        assert_eq!(tree.levels()[1].dir, tmp.path().join("beta"));
+        assert_eq!(tree.focus(), 1);
+        assert_eq!(tree.levels()[1].selected().unwrap().display_name(), "beta");
+        assert_eq!(tree.levels()[2].dir, tmp.path().join("beta"));
     }
 
     #[test]
@@ -892,13 +956,13 @@ mod tests {
         fs::write(tmp.path().join("alpha/.secret"), "").unwrap();
         let mut tree = open(tmp.path());
         step(&mut tree, |t| t.enter());
-        assert!(!names(&tree.levels()[1]).contains(&".secret".to_string()));
+        assert!(!names(&tree.levels()[2]).contains(&".secret".to_string()));
         step(&mut tree, |t| t.set_show_hidden(true));
-        assert!(names(&tree.levels()[0]).contains(&".hidden".to_string()));
-        assert!(names(&tree.levels()[1]).contains(&".secret".to_string()));
+        assert!(names(&tree.levels()[1]).contains(&".hidden".to_string()));
+        assert!(names(&tree.levels()[2]).contains(&".secret".to_string()));
         assert_eq!(tree.focused().selected().unwrap().display_name(), "inner");
         step(&mut tree, |t| t.set_show_hidden(false));
-        assert!(!names(&tree.levels()[0]).contains(&".hidden".to_string()));
+        assert!(!names(&tree.levels()[1]).contains(&".hidden".to_string()));
         assert!(tree.take_requests().is_empty());
     }
 
@@ -909,7 +973,7 @@ mod tests {
         let mut tree = Tree::new(tmp.path().to_path_buf(), true);
         tree.settle();
         step(&mut tree, |t| t.move_by(1));
-        assert_eq!(names(&tree.levels()[1]), [".dot"]);
+        assert_eq!(names(&tree.levels()[2]), [".dot"]);
     }
 
     #[test]
@@ -940,7 +1004,7 @@ mod tests {
             tree.location(),
             tmp.path().join("alpha/inner/deep/target.txt")
         );
-        assert_eq!(tree.focus(), 3);
+        assert_eq!(tree.focus(), 4);
         assert_eq!(preview_lines(&tree), ["found"]);
     }
 
@@ -951,18 +1015,18 @@ mod tests {
         tree.reveal(&tmp.path().join("alpha/inner"));
         tree.settle();
         assert_eq!(tree.location(), tmp.path().join("alpha/inner"));
-        assert_eq!(tree.focus(), 1);
+        assert_eq!(tree.focus(), 2);
     }
 
     #[test]
     fn reveal_outside_the_root_re_roots_at_the_parent() {
         let tmp = fixture();
-        let other = tempfile::tempdir().unwrap();
+        let other = crate::testdir::tempdir();
         fs::write(other.path().join("x.txt"), "x").unwrap();
         let mut tree = open(tmp.path());
         tree.reveal(&other.path().join("x.txt"));
         tree.settle();
-        assert_eq!(tree.levels()[0].dir, other.path());
+        assert_eq!(tree.levels()[1].dir, other.path());
         assert_eq!(tree.location(), other.path().join("x.txt"));
     }
 
@@ -983,7 +1047,7 @@ mod tests {
         let mut tree = open(tmp.path());
         tree.reveal(tmp.path());
         tree.settle();
-        assert_eq!(tree.levels()[0].dir, tmp.path().parent().unwrap());
+        assert_eq!(tree.levels()[1].dir, tmp.path().parent().unwrap());
         assert_eq!(tree.location(), tmp.path());
     }
 

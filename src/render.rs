@@ -100,6 +100,13 @@ pub fn render(app: &App, area: Rect, buf: &mut Buffer) {
         draw_column(buf, tree, center, *p, &levels[p.level], role, &marks);
     }
     for pair in placed.windows(2) {
+        // A brace starts at the cursor row of the level on its left, which a listing still on its way does not have yet.
+        if levels
+            .get(pair[0].level)
+            .is_some_and(|l| matches!(l.load, Load::Loading { .. }))
+        {
+            continue;
+        }
         let (spec, color) = match (levels.get(pair[1].level), editor, preview) {
             (Some(child), _, _) => (
                 layout::brace(tree.height, center, child.entries.len(), child.cursor),
@@ -888,8 +895,8 @@ mod tests {
         }
     }
 
-    fn fixture() -> tempfile::TempDir {
-        let tmp = tempfile::tempdir().unwrap();
+    fn fixture() -> crate::testdir::TestDir {
+        let tmp = crate::testdir::tempdir();
         let r = tmp.path();
         fs::create_dir_all(r.join("alpha/inner")).unwrap();
         fs::create_dir_all(r.join("beta")).unwrap();
@@ -970,7 +977,7 @@ mod tests {
 
     #[test]
     fn a_deep_path_in_a_narrow_terminal_keeps_all_three_levels_on_screen() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::testdir::tempdir();
         let deep = tmp
             .path()
             .join("aaaaaaaaaaaa/bbbbbbbbbbbb/cccccccccccc/dddddddddddd/eeeeeeeeeeee");
@@ -980,7 +987,7 @@ mod tests {
         for _ in 0..5 {
             keys(&mut app, "l");
         }
-        assert_eq!(app.tree().focus(), 5);
+        assert_eq!(app.tree().focus(), 6);
         let (lines, _) = rows(&app, 50, 9);
         let center = &lines[4];
         assert!(
@@ -1013,7 +1020,11 @@ mod tests {
         let tmp = fixture();
         let app = open(tmp.path());
         let (lines, buf) = rows(&app, 100, 11);
-        assert!(lines[5].starts_with(" alpha/"), "{:?}", lines[5]);
+        assert!(
+            lines[5].starts_with(" root/"),
+            "the parent of the start: {:?}",
+            lines[5]
+        );
         assert_ne!(
             buf[(0, 5)].bg,
             theme::rgb(BG),
@@ -1117,7 +1128,7 @@ mod tests {
 
     #[test]
     fn a_file_under_the_cursor_is_previewed_beside_a_brace_with_line_numbers() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::testdir::tempdir();
         fs::write(tmp.path().join("hello.txt"), "alpha\nbeta\ngamma\n").unwrap();
         let app = open(tmp.path());
         let (lines, _) = rows(&app, 80, 11);
@@ -1140,7 +1151,7 @@ mod tests {
 
     #[test]
     fn a_long_file_fills_the_height_and_its_brace_stays_open_at_the_bottom() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::testdir::tempdir();
         numbered_file(tmp.path(), "long.txt", 200);
         let app = open(tmp.path());
         let (lines, _) = rows(&app, 80, 15);
@@ -1163,7 +1174,7 @@ mod tests {
 
     #[test]
     fn capital_j_and_k_scroll_the_preview() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::testdir::tempdir();
         numbered_file(tmp.path(), "long.txt", 200);
         let mut app = open(tmp.path());
         app.set_viewport(13);
@@ -1202,7 +1213,7 @@ mod tests {
 
     #[test]
     fn syntax_colors_reach_the_screen() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::testdir::tempdir();
         fs::write(tmp.path().join("a.rs"), "fn main() { let x = 1; }\n").unwrap();
         let app = open(tmp.path());
         let (lines, buf) = rows(&app, 80, 11);
@@ -1215,7 +1226,7 @@ mod tests {
 
     #[test]
     fn a_failed_preview_says_why() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::testdir::tempdir();
         fs::write(tmp.path().join("bad.zip"), b"not a zip").unwrap();
         let app = open(tmp.path());
         let (lines, _) = rows(&app, 80, 11);
@@ -1225,8 +1236,8 @@ mod tests {
         );
     }
 
-    fn plain_files() -> tempfile::TempDir {
-        let tmp = tempfile::tempdir().unwrap();
+    fn plain_files() -> crate::testdir::TestDir {
+        let tmp = crate::testdir::tempdir();
         for f in ["a.txt", "b.txt", "c.txt", "d.txt"] {
             fs::write(tmp.path().join(f), f).unwrap();
         }
@@ -1243,18 +1254,13 @@ mod tests {
         let mut app = open(tmp.path());
         keys(&mut app, "<space><space>");
         let (lines, _) = rows(&app, 80, 15);
-        assert!(
-            lines[row_of(&lines, "a.txt")].starts_with('●'),
-            "{lines:#?}"
-        );
-        assert!(
-            lines[row_of(&lines, "b.txt")].starts_with('●'),
-            "{lines:#?}"
-        );
-        assert!(
-            lines[row_of(&lines, "c.txt")].starts_with(' '),
-            "{lines:#?}"
-        );
+        let before = |name: &str| {
+            let line = &lines[row_of(&lines, name)];
+            line[..line.find(name).unwrap()].chars().last().unwrap()
+        };
+        assert_eq!(before("a.txt"), '●', "{lines:#?}");
+        assert_eq!(before("b.txt"), '●', "{lines:#?}");
+        assert_eq!(before("c.txt"), ' ', "{lines:#?}");
     }
 
     #[test]
@@ -1268,15 +1274,19 @@ mod tests {
             row_of(&lines, "b.txt") as u16,
             row_of(&lines, "c.txt") as u16,
         );
-        assert_ne!(buf[(5, a)].bg, theme::rgb(BG), "anchor row is tinted");
-        assert_ne!(buf[(5, b)].bg, theme::rgb(BG), "cursor row is filled");
+        let x = lines[a as usize][..lines[a as usize].find("a.txt").unwrap()]
+            .chars()
+            .count() as u16
+            + 2;
+        assert_ne!(buf[(x, a)].bg, theme::rgb(BG), "anchor row is tinted");
+        assert_ne!(buf[(x, b)].bg, theme::rgb(BG), "cursor row is filled");
         assert_ne!(
-            buf[(5, a)].bg,
-            buf[(5, b)].bg,
+            buf[(x, a)].bg,
+            buf[(x, b)].bg,
             "the cursor row is stronger than the range"
         );
         assert_eq!(
-            buf[(5, c)].bg,
+            buf[(x, c)].bg,
             theme::rgb(BG),
             "rows outside the range are untouched"
         );
@@ -1337,8 +1347,8 @@ mod tests {
         );
     }
 
-    fn edit(content: &str) -> (tempfile::TempDir, App) {
-        let tmp = tempfile::tempdir().unwrap();
+    fn edit(content: &str) -> (crate::testdir::TestDir, App) {
+        let tmp = crate::testdir::tempdir();
         fs::write(tmp.path().join("code.rs"), content).unwrap();
         let mut app = open(tmp.path());
         keys(&mut app, "l");
@@ -1431,7 +1441,7 @@ mod tests {
 
     #[test]
     fn the_tree_keeps_to_its_share_of_the_width_and_the_preview_fills_the_rest() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::testdir::tempdir();
         let deep = tmp
             .path()
             .join("aaaaaaaaaaaaaaaaaa/bbbbbbbbbbbbbbbbbb/cccccccccccccccccc");
@@ -1501,17 +1511,17 @@ mod tests {
 
     #[test]
     fn a_picture_is_drawn_in_the_preview_with_its_card_under_it() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::testdir::tempdir();
         write_png(&tmp.path().join("photo.png"), 200, 100);
         let app = open(tmp.path());
         // Too narrow for the card to fit beside the picture.
-        let (lines, buf) = rows(&app, 60, 30);
+        let (lines, buf) = rows(&app, 80, 30);
         let card = row_of(&lines, "image/png");
         assert!(lines[card].contains("200×100"), "{lines:#?}");
         let tip = row_of(&lines, "─┤");
         let brace_x = lines[tip].chars().position(|c| c == '┤').unwrap() as u16;
-        let reds_and_blues: Vec<_> = (brace_x + 3..60)
-            .map(|x| buf[(x, (card - 2) as u16)].fg)
+        let reds_and_blues: Vec<_> = (brace_x + 3..80)
+            .map(|x| buf[(x, (card - 2) as u16)].bg)
             .filter(|c| *c != theme::rgb(BG) && *c != ratatui::style::Color::Reset)
             .collect();
         assert!(
@@ -1527,7 +1537,7 @@ mod tests {
 
     #[test]
     fn a_tall_picture_in_a_wide_column_has_its_card_beside_it() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::testdir::tempdir();
         write_png(&tmp.path().join("photo.png"), 100, 300);
         let app = open(tmp.path());
         let (lines, buf) = rows(&app, 140, 30);
@@ -1554,7 +1564,7 @@ mod tests {
 
     #[test]
     fn with_images_off_a_picture_shows_only_its_card() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::testdir::tempdir();
         write_png(&tmp.path().join("photo.png"), 20, 10);
         let mut app = App::with_settings(
             tmp.path().to_path_buf(),
@@ -1620,7 +1630,7 @@ mod tests {
 
     #[test]
     fn entries_far_from_the_cursor_keep_their_full_colour() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::testdir::tempdir();
         for i in 0..8 {
             fs::write(tmp.path().join(format!("f{i}.txt")), "x").unwrap();
         }

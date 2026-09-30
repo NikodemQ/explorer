@@ -233,8 +233,27 @@ impl Drop for Session {
     }
 }
 
-pub fn fixture() -> tempfile::TempDir {
-    let tmp = tempfile::tempdir().unwrap();
+/// A directory alone inside a fresh parent, so the parent column the tree shows above it is the
+/// same on every machine.
+pub struct Fixture {
+    root: std::path::PathBuf,
+    _parent: tempfile::TempDir,
+}
+
+impl Fixture {
+    pub fn path(&self) -> &Path {
+        &self.root
+    }
+}
+
+pub fn fixture() -> Fixture {
+    let parent = tempfile::tempdir().unwrap();
+    let root = parent.path().join("root");
+    fs::create_dir(&root).unwrap();
+    let tmp = Fixture {
+        root,
+        _parent: parent,
+    };
     let r = tmp.path();
     for d in ["apps/web/src", "apps/api", "notes", "zeta"] {
         fs::create_dir_all(r.join(d)).unwrap();
