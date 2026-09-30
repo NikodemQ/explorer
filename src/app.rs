@@ -103,8 +103,6 @@ pub struct Settings {
     /// Draws pictures in the preview.
     pub painter: Painter,
     pub depth: crate::theme::Depth,
-    /// Percent of the width the folder columns may use.
-    pub tree_width: u8,
     pub marks: Marks,
     pub trash: Arc<dyn Trasher>,
 }
@@ -115,7 +113,6 @@ impl Default for Settings {
             show_hidden: false,
             painter: Painter::blocks(),
             depth: crate::theme::Depth::TrueColor,
-            tree_width: 50,
             marks: Marks::default(),
             trash: Arc::new(NoTrash),
         }
@@ -145,7 +142,6 @@ pub struct App {
     pending_focus: Option<PathBuf>,
     /// Where the last jump started, for `''`.
     previous: Option<PathBuf>,
-    tree_width: u8,
     painter: Painter,
     depth: crate::theme::Depth,
     hitmap: std::cell::RefCell<HitMap>,
@@ -175,7 +171,6 @@ impl App {
             files: FileOps::new(settings.trash),
             pending_focus: None,
             previous: None,
-            tree_width: settings.tree_width,
             painter: settings.painter,
             depth: settings.depth,
             hitmap: std::cell::RefCell::default(),
@@ -313,10 +308,6 @@ impl App {
 
     pub fn painter(&self) -> &Painter {
         &self.painter
-    }
-
-    pub fn tree_width(&self) -> u8 {
-        self.tree_width
     }
 
     pub fn editor(&self) -> Option<&Editor> {

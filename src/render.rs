@@ -55,13 +55,7 @@ pub fn render(app: &App, area: Rect, buf: &mut Buffer) {
     let content = editor.is_some() || preview.is_some();
     // Always three columns: the parent, the focused level and what is under the cursor.
     let first = focus.saturating_sub(1);
-    let mut placed = layout::place(
-        &widths[first..],
-        content,
-        tree.width,
-        focus - first,
-        app.tree_width(),
-    );
+    let mut placed = layout::place(&widths[first..], content, tree.width);
     for p in &mut placed {
         p.level += first;
     }
@@ -975,7 +969,7 @@ mod tests {
     }
 
     #[test]
-    fn a_deep_path_in_a_narrow_terminal_keeps_the_focus_visible_inside_the_screen() {
+    fn a_deep_path_in_a_narrow_terminal_keeps_all_three_levels_on_screen() {
         let tmp = tempfile::tempdir().unwrap();
         let deep = tmp
             .path()
@@ -990,21 +984,25 @@ mod tests {
         let (lines, _) = rows(&app, 50, 9);
         let center = &lines[4];
         assert!(
-            center.starts_with(" leaf/"),
-            "focused level must be the leftmost column: {center:?}"
+            center.starts_with(" eeee"),
+            "the parent is the leftmost column, shrunk rather than dropped: {center:?}"
+        );
+        assert!(
+            center.contains("leaf/"),
+            "the focus stays visible: {center:?}"
         );
         assert!(
             center.contains("(empty)"),
             "the preview of leaf/ stays visible: {center:?}"
         );
         assert!(
-            !center.contains("aaaaaaaaaaaa/"),
-            "ancestors that do not fit scroll off: {center:?}"
+            !center.contains("dddd"),
+            "levels above the parent are not shown: {center:?}"
         );
         let (wide, _) = rows(&app, 140, 9);
         assert!(
             wide[4].contains("eeeeeeeeeeee/"),
-            "the parent returns once it fits: {:?}",
+            "the parent is whole once it fits: {:?}",
             wide[4]
         );
         assert!(lines.iter().all(|l| l.chars().count() == 50));
