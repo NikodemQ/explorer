@@ -132,7 +132,7 @@ pub fn build(path: &Path) -> io::Result<Content> {
     let is_image = infer::get(&head).is_some_and(|k| k.mime_type().starts_with("image/"));
     if is_image && meta.len() <= MAX_IMAGE_BYTES {
         match decode_image(path) {
-            Ok(image) => return Ok(image_content(&head, &meta, image)),
+            Ok(image) => return Ok(image_content(path, &head, &meta, image)),
             Err(e) => {
                 let mut content = binary_content(&head, cut, &meta);
                 content
@@ -405,7 +405,7 @@ pub fn build_quick(path: &Path) -> Option<Content> {
         return None;
     }
     let image = ImageData(std::sync::Arc::new(image));
-    Some(image_content(&head, &meta, image))
+    Some(image_content(path, &head, &meta, image))
 }
 
 fn decode_image(path: &Path) -> Result<ImageData, String> {
@@ -483,7 +483,7 @@ fn decode_jpeg_scaled(path: &Path, width: u32, height: u32) -> Result<image::Dyn
     image.ok_or_else(|| "unsupported pixel layout".to_string())
 }
 
-fn image_content(head: &[u8], meta: &fs::Metadata, image: ImageData) -> Content {
+fn image_content(path: &Path, head: &[u8], meta: &fs::Metadata, image: ImageData) -> Content {
     let mut lines = vec![
         card("type", &describe_type(head)),
         card("size", &human_size(meta.len())),
@@ -491,10 +491,142 @@ fn image_content(head: &[u8], meta: &fs::Metadata, image: ImageData) -> Content 
     if let Ok(modified) = meta.modified() {
         lines.push(card("modified", &format_time(modified)));
     }
+    lines.extend(
+        photo_facts(path)
+            .into_iter()
+            .map(|(key, value)| card(key, &value)),
+    );
     Content {
         image: Some(image),
         lines,
         numbered: false,
+    }
+}
+
+/// What the camera recorded about a photo: which camera and lens, when, and how it was exposed.
+/// Only the header is read, and a file without these simply has none.
+fn photo_facts(path: &Path) -> Vec<(&'static str, String)> {
+    use exif::{In, Tag, Value};
+    let mut head = Vec::new();
+    let read = File::open(path).and_then(|f| f.take(PREVIEW_SCAN_BYTES).read_to_end(&mut head));
+    let Some(exif) = read.ok().and_then(|_| {
+        exif::Reader::new()
+            .read_from_container(&mut io::Cursor::new(head))
+            .ok()
+    }) else {
+        return Vec::new();
+    };
+    let value = |tag| exif.get_field(tag, In::PRIMARY).map(|f| &f.value);
+    let text = |tag| match value(tag)? {
+        Value::Ascii(parts) => {
+            let joined = parts
+                .iter()
+                .map(|p| {
+                    String::from_utf8_lossy(p)
+                        .trim_matches(['\0', ' '])
+                        .to_string()
+                })
+                .filter(|p| !p.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+            (!joined.is_empty()).then_some(joined)
+        }
+        _ => None,
+    };
+    let number = |tag| match value(tag)? {
+        Value::Rational(r) => r.first().filter(|r| r.denom != 0).map(|r| r.to_f64()),
+        other => other.get_uint(0).map(f64::from),
+    };
+    let mut facts = Vec::new();
+
+    let make = text(Tag::Make);
+    let model = text(Tag::Model);
+    let camera = match (make, model) {
+        // Most cameras repeat the maker in the model name.
+        (Some(make), Some(model)) if model.to_lowercase().starts_with(&make.to_lowercase()) => {
+            Some(model)
+        }
+        (Some(make), Some(model)) => Some(format!("{make} {model}")),
+        (make, model) => make.or(model),
+    };
+    facts.extend(camera.map(|c| ("camera", c)));
+    facts.extend(text(Tag::LensModel).map(|l| ("lens", l)));
+    if let Some(taken) = exif.get_field(Tag::DateTimeOriginal, In::PRIMARY) {
+        facts.push(("taken", taken.display_value().to_string()));
+    }
+
+    let mut exposure = Vec::new();
+    if let Some(Value::Rational(r)) = value(Tag::ExposureTime)
+        && let Some(t) = r.first().filter(|t| t.num != 0 && t.denom != 0)
+    {
+        exposure.push(if t.num >= t.denom {
+            format!("{} s", short(t.to_f64()))
+        } else {
+            format!("1/{} s", (f64::from(t.denom) / f64::from(t.num)).round())
+        });
+    }
+    if let Some(f) = number(Tag::FNumber).filter(|f| *f > 0.0) {
+        exposure.push(format!("f/{}", short(f)));
+    }
+    if let Some(iso) = number(Tag::PhotographicSensitivity).filter(|i| *i > 0.0) {
+        exposure.push(format!("ISO {iso}"));
+    }
+    if let Some(focal) = number(Tag::FocalLength).filter(|f| *f > 0.0) {
+        let mut text = format!("{} mm", short(focal));
+        if let Some(full) =
+            number(Tag::FocalLengthIn35mmFilm).filter(|f| *f > 0.0 && (f - focal).abs() >= 1.0)
+        {
+            text.push_str(&format!(" ({full} mm eq.)"));
+        }
+        exposure.push(text);
+    }
+    if !exposure.is_empty() {
+        facts.push(("exposure", exposure.join("  ")));
+    }
+    if value(Tag::Flash)
+        .and_then(|v| v.get_uint(0))
+        .is_some_and(|f| f & 1 == 1)
+    {
+        facts.push(("flash", "fired".to_string()));
+    }
+
+    let degrees = |tag, reference, negative: &str| {
+        let Value::Rational(dms) = value(tag)? else {
+            return None;
+        };
+        let [d, m, s] = dms.get(..3)? else {
+            return None;
+        };
+        if [d, m, s].iter().any(|r| r.denom == 0) {
+            return None;
+        }
+        let deg = d.to_f64() + m.to_f64() / 60.0 + s.to_f64() / 3600.0;
+        let side = text(reference).unwrap_or_default();
+        Some((deg, side.eq_ignore_ascii_case(negative)))
+    };
+    if let (Some((lat, south)), Some((lon, west))) = (
+        degrees(Tag::GPSLatitude, Tag::GPSLatitudeRef, "S"),
+        degrees(Tag::GPSLongitude, Tag::GPSLongitudeRef, "W"),
+    ) {
+        facts.push((
+            "location",
+            format!(
+                "{lat:.5}° {}, {lon:.5}° {}",
+                if south { "S" } else { "N" },
+                if west { "W" } else { "E" }
+            ),
+        ));
+    }
+    facts
+}
+
+/// A number with at most one decimal, and none when it is whole: 2.8, 8, 0.5.
+fn short(value: f64) -> String {
+    let rounded = (value * 10.0).round() / 10.0;
+    if rounded.fract() == 0.0 {
+        format!("{rounded:.0}")
+    } else {
+        format!("{rounded:.1}")
     }
 }
 
@@ -1076,6 +1208,94 @@ mod tests {
             text(&content)[0].starts_with("cannot show the picture"),
             "{:?}",
             text(&content)
+        );
+    }
+
+    fn png_with_exif(fields: &[exif::Field]) -> Vec<u8> {
+        use image::ImageEncoder;
+        let mut writer = exif::experimental::Writer::new();
+        for field in fields {
+            writer.push_field(field);
+        }
+        let mut tiff = std::io::Cursor::new(Vec::new());
+        writer.write(&mut tiff, false).unwrap();
+        let mut out = Vec::new();
+        let mut encoder = image::codecs::png::PngEncoder::new(&mut out);
+        encoder.set_exif_metadata(tiff.into_inner()).unwrap();
+        let pixels = vec![128u8; 16 * 8 * 3];
+        encoder
+            .write_image(&pixels, 16, 8, image::ExtendedColorType::Rgb8)
+            .unwrap();
+        out
+    }
+
+    #[test]
+    fn a_photo_card_says_which_camera_took_it_and_how() {
+        use exif::{Field, In, Rational, Tag, Value};
+        let field = |tag, value| Field {
+            tag,
+            ifd_num: In::PRIMARY,
+            value,
+        };
+        let ascii = |s: &str| Value::Ascii(vec![s.as_bytes().to_vec()]);
+        let rational = |num, denom| Value::Rational(vec![Rational { num, denom }]);
+        let dms = |d, m, s| {
+            Value::Rational(vec![
+                Rational { num: d, denom: 1 },
+                Rational { num: m, denom: 1 },
+                Rational { num: s, denom: 100 },
+            ])
+        };
+        let (_t, path) = file(
+            "shot.png",
+            &png_with_exif(&[
+                field(Tag::Make, ascii("FUJIFILM")),
+                field(Tag::Model, ascii("X-T5")),
+                field(Tag::LensModel, ascii("XF35mmF1.4 R")),
+                field(Tag::DateTimeOriginal, ascii("2026:05:01 18:04:09")),
+                field(Tag::ExposureTime, rational(1, 250)),
+                field(Tag::FNumber, rational(28, 10)),
+                field(Tag::PhotographicSensitivity, Value::Short(vec![400])),
+                field(Tag::FocalLength, rational(35, 1)),
+                field(Tag::FocalLengthIn35mmFilm, Value::Short(vec![53])),
+                field(Tag::Flash, Value::Short(vec![0x10])),
+                field(Tag::GPSLatitudeRef, ascii("N")),
+                field(Tag::GPSLatitude, dms(52, 13, 4700)),
+                field(Tag::GPSLongitudeRef, ascii("W")),
+                field(Tag::GPSLongitude, dms(21, 0, 3600)),
+            ]),
+        );
+        let lines = text(&build(&path).unwrap());
+        let row = |key: &str| {
+            lines
+                .iter()
+                .find(|l| l.starts_with(key))
+                .unwrap_or_else(|| panic!("no {key} in {lines:#?}"))
+                .clone()
+        };
+        assert_eq!(row("camera"), "camera   FUJIFILM X-T5");
+        assert_eq!(row("lens"), "lens     XF35mmF1.4 R");
+        assert_eq!(row("taken"), "taken    2026-05-01 18:04:09");
+        assert_eq!(
+            row("exposure"),
+            "exposure 1/250 s  f/2.8  ISO 400  35 mm (53 mm eq.)"
+        );
+        assert_eq!(row("location"), "location 52.22972° N, 21.01000° W");
+        assert!(
+            !lines.iter().any(|l| l.starts_with("flash")),
+            "a flash that did not fire is not worth a line"
+        );
+    }
+
+    #[test]
+    fn a_picture_without_camera_data_keeps_the_short_card() {
+        let (_t, path) = file("pic.png", &png(64, 32));
+        let lines = text(&build(&path).unwrap());
+        assert!(
+            !lines.iter().any(|l| ["camera", "exposure", "taken"]
+                .iter()
+                .any(|k| l.starts_with(k))),
+            "{lines:#?}"
         );
     }
 }

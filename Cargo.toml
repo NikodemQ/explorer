@@ -12,6 +12,7 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 imagesize = "0.15.0"
 infer = "0.22.0"
 jpeg-decoder = "0.3.2"
+kamadak-exif = "0.6.1"
 notify = "8.2.0"
 ratatui = "0.30.2"
 ratatui-image = { version = "11.1.0", default-features = false, features = ["crossterm"] }
