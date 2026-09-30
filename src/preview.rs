@@ -496,11 +496,69 @@ fn image_content(path: &Path, head: &[u8], meta: &fs::Metadata, image: ImageData
             .into_iter()
             .map(|(key, value)| card(key, &value)),
     );
+    lines.push(Line::default());
+    lines.extend(histogram(&image.0));
     Content {
         image: Some(image),
         lines,
         numbered: false,
     }
+}
+
+const HISTOGRAM_BINS: usize = 32;
+const HISTOGRAM_ROWS: usize = 4;
+/// Clipping below this share of the pixels is not worth a line.
+const CLIPPED_SHARE: f64 = 0.005;
+
+/// How the brightness of a picture is spread, as bars from shadows on the left to highlights on
+/// the right, and a line when a share of it is pure black or pure white. Counted on the picture
+/// as shown, which has the same shape as the full photo but slightly fewer clipped pixels.
+fn histogram(image: &image::DynamicImage) -> Vec<Line> {
+    let rgb = match image.as_rgb8() {
+        Some(rgb) => std::borrow::Cow::Borrowed(rgb),
+        None => std::borrow::Cow::Owned(image.to_rgb8()),
+    };
+    let mut bins = [0u64; HISTOGRAM_BINS];
+    let (mut dark, mut bright) = (0u64, 0u64);
+    for pixel in rgb.pixels() {
+        let [r, g, b] = pixel.0;
+        let luma = (2126 * u32::from(r) + 7152 * u32::from(g) + 722 * u32::from(b)) / 10_000;
+        bins[luma as usize * HISTOGRAM_BINS / 256] += 1;
+        dark += u64::from(r.max(g).max(b) == 0);
+        bright += u64::from(r.min(g).min(b) == 255);
+    }
+    // The end bins hold the clipped pixels, and a spike there would flatten everything between.
+    let peak = bins[1..HISTOGRAM_BINS - 1]
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(0)
+        .max(1) as f64;
+    const GLYPHS: [char; 9] = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let mut lines: Vec<Line> = (0..HISTOGRAM_ROWS)
+        .map(|row| {
+            let floor = (HISTOGRAM_ROWS - 1 - row) * 8;
+            let bars = bins
+                .iter()
+                .map(|&count| {
+                    let eighths = ((count as f64 / peak).min(1.0) * (HISTOGRAM_ROWS * 8) as f64)
+                        .round() as usize;
+                    GLYPHS[eighths.saturating_sub(floor).min(8)]
+                })
+                .collect::<String>();
+            Line(vec![Span::new(bars, DIM)])
+        })
+        .collect();
+    let total = (rgb.width() as f64 * rgb.height() as f64).max(1.0);
+    let clipped: Vec<String> = [("shadows", dark), ("highlights", bright)]
+        .into_iter()
+        .filter(|(_, count)| *count as f64 / total >= CLIPPED_SHARE)
+        .map(|(side, count)| format!("{side} {:.1}%", count as f64 * 100.0 / total))
+        .collect();
+    if !clipped.is_empty() {
+        lines.push(card("clipped", &clipped.join("  ")));
+    }
+    lines
 }
 
 /// What the camera recorded about a photo: which camera and lens, when, and how it was exposed.
@@ -1297,5 +1355,39 @@ mod tests {
                 .any(|k| l.starts_with(k))),
             "{lines:#?}"
         );
+    }
+
+    #[test]
+    fn a_picture_gets_a_brightness_histogram_and_says_what_is_clipped() {
+        let img = image::RgbImage::from_fn(48, 8, |x, _| match x {
+            0..16 => image::Rgb([0, 0, 0]),
+            16..32 => image::Rgb([128, 128, 128]),
+            _ => image::Rgb([255, 255, 255]),
+        });
+        let lines = text(&Content {
+            lines: histogram(&image::DynamicImage::ImageRgb8(img)),
+            image: None,
+            numbered: false,
+        });
+        assert_eq!(lines.len(), HISTOGRAM_ROWS + 1, "{lines:#?}");
+        for bars in &lines[..HISTOGRAM_ROWS] {
+            let bars: Vec<char> = bars.chars().collect();
+            assert_eq!(bars.len(), HISTOGRAM_BINS);
+            assert_eq!(bars[0], '█', "black at the far left: {lines:#?}");
+            assert_eq!(bars[HISTOGRAM_BINS / 2], '█', "grey in the middle");
+            assert_eq!(bars[HISTOGRAM_BINS - 1], '█', "white at the far right");
+            assert_eq!(bars.iter().filter(|c| **c != ' ').count(), 3, "{lines:#?}");
+        }
+        assert_eq!(
+            lines[HISTOGRAM_ROWS],
+            "clipped  shadows 33.3%  highlights 33.3%"
+        );
+    }
+
+    #[test]
+    fn a_picture_without_clipped_pixels_has_no_clipping_line() {
+        let img = image::RgbImage::from_pixel(8, 8, image::Rgb([100, 150, 200]));
+        let lines = histogram(&image::DynamicImage::ImageRgb8(img));
+        assert_eq!(lines.len(), HISTOGRAM_ROWS);
     }
 }
