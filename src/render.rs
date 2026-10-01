@@ -435,6 +435,7 @@ fn draw_preview(
     preview: &FilePreview,
     painter: &Painter,
 ) {
+    painter.note_room(p.width.saturating_sub(1), tree.height);
     let color = preview_color(preview);
     let x = tree.x + p.x;
     let note = |buf: &mut Buffer, text: &str| {

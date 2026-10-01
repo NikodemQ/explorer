@@ -310,6 +310,10 @@ impl App {
         &self.painter
     }
 
+    pub fn painter_mut(&mut self) -> &mut Painter {
+        &mut self.painter
+    }
+
     pub fn editor(&self) -> Option<&Editor> {
         match &self.mode {
             Mode::Edit(editor) => Some(editor),
@@ -456,7 +460,11 @@ impl App {
                 let result = crate::fsread::read_dir(&r.dir, r.keep.as_deref(), r.hidden);
                 self.finish_load(&r.dir, result);
             }
-            for r in self.tree.take_preview_requests() {
+            let previews = self.tree.take_preview_requests();
+            for r in previews
+                .into_iter()
+                .chain(self.tree.take_prefetch_requests())
+            {
                 progressed = true;
                 let result = crate::preview::build(&r.path);
                 self.tree.finish_preview(&r, result);

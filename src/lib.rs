@@ -7,6 +7,8 @@ pub mod editor;
 pub mod excmd;
 pub mod fileops;
 pub mod fsread;
+#[cfg(target_os = "macos")]
+mod imageio;
 pub mod imageview;
 pub mod jumps;
 pub mod keys;
@@ -18,6 +20,7 @@ pub mod motion;
 pub mod ops;
 pub mod preview;
 pub mod prompt;
+mod rawfile;
 pub mod render;
 pub mod runtime;
 pub mod save;

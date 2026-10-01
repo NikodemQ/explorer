@@ -15,6 +15,11 @@ use std::{
 pub struct Answers {
     /// The terminal accepted a kitty graphics query.
     pub kitty: bool,
+    /// It also read a picture from a temporary file of ours, so it runs on this machine and
+    /// pictures need not travel through the connection.
+    pub kitty_files: bool,
+    /// It inflates zlib-compressed pictures, which then cross a slow connection in fewer bytes.
+    pub kitty_zlib: bool,
     /// DA1 listed sixel graphics (attribute 4).
     pub sixel: bool,
     /// The name and version from XTVERSION, such as `foot(1.16.2)` or `WezTerm 20240203`.
@@ -30,9 +35,26 @@ const XTVERSION: &str = "\x1b[>0q";
 const CELL_SIZE: &str = "\x1b[16t";
 const DA1: &str = "\x1b[c";
 
-/// The bytes to send. Inside tmux the questions about graphics go through to the outer terminal,
-/// which tmux only allows with its `allow-passthrough` option on.
-pub fn questions(in_tmux: bool) -> String {
+/// A kitty graphics query for a one pixel picture sent compressed.
+fn kitty_zlib_query() -> String {
+    use std::io::Write as _;
+    let mut zlib = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+    let _ = zlib.write_all(&[0; 3]);
+    let data = base64_simd::STANDARD.encode_to_string(zlib.finish().unwrap_or_default());
+    format!("\x1b_Gi=33,s=1,v=1,a=q,t=d,f=24,o=z;{data}\x1b\\")
+}
+
+/// A kitty graphics query for a one pixel picture in the file at `path`.
+fn kitty_file_query(path: &std::path::Path) -> String {
+    use std::os::unix::ffi::OsStrExt;
+    let name = base64_simd::STANDARD.encode_to_string(path.as_os_str().as_bytes());
+    format!("\x1b_Gi=32,s=1,v=1,a=q,t=t,f=24;{name}\x1b\\")
+}
+
+/// The bytes to send, with a question about reading pictures from the file at `probe` when given.
+/// Inside tmux the questions about graphics go through to the outer terminal, which tmux only
+/// allows with its `allow-passthrough` option on.
+pub fn questions(in_tmux: bool, probe: Option<&std::path::Path>) -> String {
     let wrap = |q: &str| {
         if in_tmux {
             format!("\x1bPtmux;{}\x1b\\", q.replace('\x1b', "\x1b\x1b"))
@@ -41,8 +63,12 @@ pub fn questions(in_tmux: bool) -> String {
         }
     };
     format!(
-        "{}{}{}{DA1}",
+        "{}{}{}{}{}{DA1}",
         wrap(KITTY_QUERY),
+        wrap(&kitty_zlib_query()),
+        probe
+            .map(|p| wrap(&kitty_file_query(p)))
+            .unwrap_or_default(),
         wrap(XTVERSION),
         wrap(CELL_SIZE)
     )
@@ -59,8 +85,10 @@ pub fn parse(bytes: &[u8]) -> Answers {
         if let Some(body) = rest.strip_prefix("\x1b_G") {
             let end = body.find("\x1b\\").unwrap_or(body.len());
             let reply = &body[..end];
-            if reply.starts_with("i=31") && reply.ends_with(";OK") {
-                answers.kitty = true;
+            if reply.ends_with(";OK") {
+                answers.kitty |= reply.starts_with("i=31");
+                answers.kitty_files |= reply.starts_with("i=32");
+                answers.kitty_zlib |= reply.starts_with("i=33");
             }
             rest = &body[end..];
         } else if let Some(body) = rest.strip_prefix("\x1bP>|") {
@@ -93,9 +121,28 @@ pub fn parse(bytes: &[u8]) -> Answers {
 /// Sends the questions and collects the answers until DA1 arrives or `timeout` passes.
 /// The terminal must be in raw mode, and nothing else may be reading stdin yet.
 pub fn ask(in_tmux: bool, timeout: Duration) -> io::Result<Answers> {
+    // The terminal deletes the file once it has read it, like the pictures sent this way later.
+    // The name must say what it is for, and the file must be in the temporary folder.
+    let probe = std::env::temp_dir().join(format!(
+        "tty-graphics-protocol-tx-{}-probe",
+        std::process::id()
+    ));
+    let probe = std::fs::write(&probe, [0u8; 3]).is_ok().then_some(probe);
+    let answers = ask_with(in_tmux, timeout, probe.as_deref());
+    if let Some(probe) = probe {
+        let _ = std::fs::remove_file(probe);
+    }
+    answers
+}
+
+fn ask_with(
+    in_tmux: bool,
+    timeout: Duration,
+    probe: Option<&std::path::Path>,
+) -> io::Result<Answers> {
     use rustix::event::{PollFd, PollFlags, Timespec, poll};
     let mut out = io::stdout();
-    out.write_all(questions(in_tmux).as_bytes())?;
+    out.write_all(questions(in_tmux, probe).as_bytes())?;
     out.flush()?;
     let stdin = io::stdin();
     let fd = stdin.as_fd();
@@ -178,9 +225,19 @@ mod tests {
 
     #[test]
     fn inside_tmux_the_graphics_questions_are_passed_through_and_da1_is_not() {
-        let q = questions(true);
+        let q = questions(true, None);
         assert!(q.starts_with("\x1bPtmux;\x1b\x1b_Gi=31"), "{q:?}");
         assert!(q.ends_with("\x1b[c"));
-        assert!(!questions(false).contains("tmux;"));
+        assert!(!questions(false, None).contains("tmux;"));
+    }
+
+    #[test]
+    fn a_terminal_that_reads_the_probe_file_can_take_pictures_as_files() {
+        let q = questions(false, Some(std::path::Path::new("/tmp/x")));
+        assert!(q.contains("i=32,s=1,v=1,a=q,t=t,f=24;L3RtcC94"), "{q:?}");
+        let a = parse(b"\x1b_Gi=31;OK\x1b\\\x1b_Gi=32;OK\x1b\\\x1b_Gi=33;OK\x1b\\\x1b[?62;c");
+        assert!(a.kitty && a.kitty_files && a.kitty_zlib);
+        let a = parse(b"\x1b_Gi=31;OK\x1b\\\x1b_Gi=32;EBADF:no such file\x1b\\\x1b[?62;c");
+        assert!(a.kitty && !a.kitty_files, "over SSH the file is not there");
     }
 }

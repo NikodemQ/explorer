@@ -31,14 +31,15 @@ fn main() {
         std::fs::metadata(&path).unwrap().len() / 1_000_000
     );
     let t = Instant::now();
-    let full = image::open(&path).unwrap();
-    println!(
-        "before: full decode alone: {:?} ({}x{})",
-        t.elapsed(),
-        full.width(),
-        full.height()
-    );
-    drop(full);
+    match image::open(&path) {
+        Ok(full) => println!(
+            "before: full decode alone: {:?} ({}x{})",
+            t.elapsed(),
+            full.width(),
+            full.height()
+        ),
+        Err(e) => println!("before: the image library cannot read it: {e}"),
+    }
     // A 220x55 terminal with the folders taking half the width, as by default.
     let screen = (220u16, 55u16);
     println!(
@@ -98,5 +99,7 @@ fn main() {
         let t = Instant::now();
         painter.draw(&path, &image, area, &mut buf);
         println!("{name}: drawing it again from the cache: {:?}", t.elapsed());
+        let bytes: usize = buf.content().iter().map(|c| c.symbol().len()).sum();
+        println!("{name}: bytes sent to the terminal: {} KB", bytes / 1000);
     }
 }
