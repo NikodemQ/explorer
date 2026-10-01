@@ -75,15 +75,11 @@ fn main() -> io::Result<()> {
     };
     let painter = Painter::new(images, answers.as_ref()).remote(over_ssh);
     let screen = terminal.size()?;
-    // Pictures only ever fill the preview column, which gets what the folder columns leave.
-    let preview_columns =
-        u32::from(screen.width) * u32::from(100 - config.tree_width.min(80)) / 100;
-    let (width, height) =
-        painter.decode_target(preview_columns as u16, screen.height.saturating_sub(2));
+    // Pictures only ever fill the preview column, which usually gets about half the screen.
+    let (width, height) = painter.decode_target(screen.width / 2, screen.height.saturating_sub(2));
     tx::preview::set_image_target(width, height);
     let settings = Settings {
         show_hidden: config.show_hidden,
-        tree_width: config.tree_width,
         painter,
         depth,
         marks: Marks::open(Marks::default_file()),

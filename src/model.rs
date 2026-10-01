@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     ffi::OsString,
     io,
     path::{Path, PathBuf},
@@ -135,8 +135,15 @@ struct PreviewCache {
 }
 
 impl PreviewCache {
-    fn get(&self, path: &Path, key: PreviewKey) -> Option<Arc<Content>> {
-        self.entries.get(&(path.to_path_buf(), key)).cloned()
+    /// A hit counts as a use, so the previews returned to most are the last to go.
+    fn get(&mut self, path: &Path, key: PreviewKey) -> Option<Arc<Content>> {
+        let id = (path.to_path_buf(), key);
+        let found = self.entries.get(&id).cloned()?;
+        if let Some(at) = self.order.iter().position(|o| *o == id) {
+            self.order.remove(at);
+            self.order.push_back(id);
+        }
+        Some(found)
     }
 
     fn insert(&mut self, path: PathBuf, key: PreviewKey, content: Arc<Content>) {
@@ -178,6 +185,10 @@ pub struct Tree {
     preview: Option<FilePreview>,
     preview_cache: PreviewCache,
     preview_requests: Vec<PreviewRequest>,
+    /// Files next to the cursor, read ahead so stepping onto them is instant.
+    prefetch_requests: Vec<PreviewRequest>,
+    /// Previews asked for and not answered yet, so none is read twice at once.
+    in_flight: HashSet<(PathBuf, PreviewKey)>,
     show_hidden: bool,
     /// Path components still to walk after a [`Tree::reveal`], one per level as listings arrive.
     reveal: VecDeque<OsString>,
@@ -194,11 +205,14 @@ impl Tree {
             preview: None,
             preview_cache: PreviewCache::default(),
             preview_requests: Vec::new(),
+            prefetch_requests: Vec::new(),
+            in_flight: HashSet::new(),
             show_hidden,
             reveal: VecDeque::new(),
             notice: None,
         };
         tree.push_level(Level::pending(root, 0, show_hidden));
+        tree.sync_preview();
         tree
     }
 
@@ -260,6 +274,13 @@ impl Tree {
     }
 
     fn advance_reveal(&mut self) {
+        self.walk_reveal();
+        if self.focus == 0 && self.reveal.is_empty() {
+            self.insert_parent();
+        }
+    }
+
+    fn walk_reveal(&mut self) {
         while let Some(name) = self.reveal.front().cloned() {
             let level = &mut self.levels[self.focus];
             match level.load {
@@ -331,12 +352,73 @@ impl Tree {
         std::mem::take(&mut self.preview_requests)
     }
 
+    pub fn take_prefetch_requests(&mut self) -> Vec<PreviewRequest> {
+        std::mem::take(&mut self.prefetch_requests)
+    }
+
+    /// The file under the cursor and its neighbours: the previews still worth reading.
+    pub fn nearby(&self) -> Vec<PathBuf> {
+        let mut paths: Vec<PathBuf> = self.neighbours().into_iter().map(|(p, _)| p).collect();
+        paths.extend(self.preview.as_ref().map(|p| p.path.clone()));
+        paths
+    }
+
+    /// The openable files just above and below the cursor in the focused folder.
+    fn neighbours(&self) -> Vec<(PathBuf, PreviewKey)> {
+        let Some(level) = self.levels.get(self.focus) else {
+            return Vec::new();
+        };
+        [level.cursor.checked_sub(1), level.cursor.checked_add(1)]
+            .into_iter()
+            .flatten()
+            .filter_map(|i| level.entries.get(i))
+            .filter(|e| e.is_openable())
+            .map(|e| (level.dir.join(&e.name), (e.size, e.mtime)))
+            .collect()
+    }
+
+    /// Asks for a preview unless it is already on its way.
+    fn request_preview(&mut self, path: &Path, key: PreviewKey, prefetch: bool) {
+        if !self.in_flight.insert((path.to_path_buf(), key)) {
+            return;
+        }
+        let request = PreviewRequest {
+            path: path.to_path_buf(),
+            key,
+        };
+        if prefetch {
+            self.prefetch_requests.push(request);
+        } else {
+            self.preview_requests.push(request);
+        }
+    }
+
+    /// A first, rough preview, such as the camera's own picture in a photo's header. It is shown but
+    /// not kept, since the real one replaces it and a cached rough one would never be refined.
+    pub fn show_provisional(&mut self, request: &PreviewRequest, content: Content) {
+        if let Some(p) = self.preview.as_mut()
+            && p.path == request.path
+            && p.key == request.key
+            && matches!(p.state, PreviewState::Loading { .. })
+        {
+            p.state = PreviewState::Ready(Arc::new(content));
+        }
+    }
+
     pub fn finish_preview(&mut self, request: &PreviewRequest, result: io::Result<Content>) {
-        // A skipped request says nothing about the file. If it is wanted again, a new request is on its way.
+        self.in_flight.remove(&(request.path.clone(), request.key));
+        // A skipped request says nothing about the file. Ask again if the cursor has come back to it.
         if result
             .as_ref()
             .is_err_and(|e| e.kind() == io::ErrorKind::Interrupted)
         {
+            if self
+                .preview
+                .as_ref()
+                .is_some_and(|p| p.path == request.path && p.key == request.key)
+            {
+                self.request_preview(&request.path, request.key, false);
+            }
             return;
         }
         let outcome = result.map(Arc::new).map_err(|e| e.to_string());
@@ -451,11 +533,18 @@ impl Tree {
     }
 
     pub fn leave(&mut self) {
+        if self.focus == 0 {
+            self.insert_parent();
+        }
         if self.focus > 0 {
             self.focus -= 1;
             self.sync_preview();
-            return;
         }
+    }
+
+    /// Lists the directory above the top level, with its cursor on the child, and keeps the focus
+    /// where it was. The old levels stay behind the parent until it loads; `sync_preview` then reuses them.
+    fn insert_parent(&mut self) {
         let child = self.levels[0].dir.clone();
         let (Some(parent), Some(name)) = (child.parent(), child.file_name()) else {
             return;
@@ -463,9 +552,9 @@ impl Tree {
         let mut level = Level::pending(parent.to_path_buf(), 0, self.show_hidden);
         level.keep = Some(name.to_os_string());
         level.anchor = Some(name.to_os_string());
-        // The old levels stay behind the parent until it loads; `sync_preview` then reuses them.
         self.requests.push(level.request());
         self.levels.insert(0, level);
+        self.focus += 1;
     }
 
     fn push_level(&mut self, level: Level) {
@@ -473,8 +562,17 @@ impl Tree {
         self.levels.push(level);
     }
 
-    /// Makes the level after `focus` match the directory under the cursor, reusing it when it already does.
+    /// Keeps the focus between its parent and the level after it: the parent is listed whenever
+    /// the focus reaches the top, except while a reveal is still walking down from there.
     fn sync_preview(&mut self) {
+        self.sync_child();
+        if self.focus == 0 && self.reveal.is_empty() {
+            self.insert_parent();
+        }
+    }
+
+    /// Makes the level after `focus` match the directory under the cursor, reusing it when it already does.
+    fn sync_child(&mut self) {
         let level = &self.levels[self.focus];
         let file = level
             .selected()
@@ -523,10 +621,7 @@ impl Tree {
         let state = match self.preview_cache.get(&path, key) {
             Some(content) => PreviewState::Ready(content),
             None => {
-                self.preview_requests.push(PreviewRequest {
-                    path: path.clone(),
-                    key,
-                });
+                self.request_preview(&path, key, false);
                 PreviewState::Loading {
                     since: Instant::now(),
                 }
@@ -538,11 +633,17 @@ impl Tree {
             state,
             scroll,
         });
+        for (path, key) in self.neighbours() {
+            if self.preview_cache.get(&path, key).is_none() {
+                self.request_preview(&path, key, true);
+            }
+        }
     }
 
     /// After level `i` changed, drop the levels to its right that no longer follow from its cursor.
+    /// A level that could not be listed says nothing about them, so they stay.
     fn reconcile(&mut self, i: usize) {
-        if i < self.focus {
+        if i < self.focus && matches!(self.levels[i].load, Load::Ready) {
             let level = &self.levels[i];
             let follows = level
                 .selected()
@@ -568,7 +669,8 @@ impl Tree {
                 self.finish_load(&r.dir, result);
             }
         }
-        for r in self.take_preview_requests() {
+        let previews = self.take_preview_requests();
+        for r in previews.into_iter().chain(self.take_prefetch_requests()) {
             let result = crate::preview::build(&r.path);
             self.finish_preview(&r, result);
         }
@@ -581,8 +683,8 @@ mod tests {
 
     use super::*;
 
-    fn fixture() -> tempfile::TempDir {
-        let tmp = tempfile::tempdir().unwrap();
+    fn fixture() -> crate::testdir::TestDir {
+        let tmp = crate::testdir::tempdir();
         let r = tmp.path();
         fs::create_dir_all(r.join("alpha/inner")).unwrap();
         fs::create_dir_all(r.join("beta")).unwrap();
@@ -613,18 +715,18 @@ mod tests {
     fn lists_dirs_first_and_hides_dotfiles() {
         let tmp = fixture();
         let tree = open(tmp.path());
-        assert_eq!(names(&tree.levels()[0]), ["alpha", "beta", "file.md"]);
+        assert_eq!(names(&tree.levels()[1]), ["alpha", "beta", "file.md"]);
     }
 
     #[test]
     fn preview_follows_cursor_and_vanishes_on_files() {
         let tmp = fixture();
         let mut tree = open(tmp.path());
-        assert_eq!(names(&tree.levels()[1]), ["inner", "one.txt", "two.txt"]);
+        assert_eq!(names(&tree.levels()[2]), ["inner", "one.txt", "two.txt"]);
         step(&mut tree, |t| t.move_by(1));
-        assert_eq!(tree.levels()[1].dir, tmp.path().join("beta"));
+        assert_eq!(tree.levels()[2].dir, tmp.path().join("beta"));
         step(&mut tree, |t| t.move_by(1));
-        assert_eq!(tree.levels().len(), 1);
+        assert_eq!(tree.levels().len(), 2);
     }
 
     #[test]
@@ -632,24 +734,39 @@ mod tests {
         let tmp = fixture();
         let mut tree = open(tmp.path());
         step(&mut tree, |t| t.enter());
-        assert_eq!(tree.focus(), 1);
+        assert_eq!(tree.focus(), 2);
         step(&mut tree, |t| t.move_by(2));
         step(&mut tree, |t| t.leave());
-        assert_eq!(tree.focus(), 0);
+        assert_eq!(tree.focus(), 1);
         step(&mut tree, |t| t.enter());
-        assert_eq!(tree.levels()[1].cursor, 2);
+        assert_eq!(tree.levels()[2].cursor, 2);
     }
 
     #[test]
-    fn leave_at_root_loads_the_parent_with_cursor_on_the_child() {
+    fn leaving_the_top_level_lists_the_one_above_it_and_keeps_the_focus_in_the_middle() {
         let tmp = fixture();
         let mut tree = open(&tmp.path().join("alpha"));
         step(&mut tree, |t| t.move_by(1));
+        assert_eq!(
+            tree.focus(),
+            1,
+            "the start is between its parent and its child"
+        );
         step(&mut tree, |t| t.leave());
-        assert_eq!(tree.levels()[0].dir, tmp.path());
-        assert_eq!(tree.levels()[0].selected().unwrap().display_name(), "alpha");
-        assert_eq!(tree.levels()[1].dir, tmp.path().join("alpha"));
-        assert_eq!(tree.levels().len(), 2);
+        assert_eq!(
+            tree.focus(),
+            1,
+            "the focus stays in the middle, not on the leftmost column"
+        );
+        assert_eq!(
+            tree.levels()[0].dir,
+            tmp.path().parent().unwrap(),
+            "the level above the new focus is listed too"
+        );
+        assert_eq!(tree.levels()[1].dir, tmp.path());
+        assert_eq!(tree.levels()[1].selected().unwrap().display_name(), "alpha");
+        assert_eq!(tree.levels()[2].dir, tmp.path().join("alpha"));
+        assert_eq!(tree.levels().len(), 3);
     }
 
     #[test]
@@ -658,7 +775,7 @@ mod tests {
         fs::create_dir_all(tmp.path().join(".dot/sub")).unwrap();
         let mut tree = open(&tmp.path().join(".dot"));
         step(&mut tree, |t| t.leave());
-        assert_eq!(tree.levels()[0].selected().unwrap().display_name(), ".dot");
+        assert_eq!(tree.levels()[1].selected().unwrap().display_name(), ".dot");
     }
 
     #[test]
@@ -675,11 +792,31 @@ mod tests {
     fn unreadable_directory_becomes_a_failed_level() {
         let mut tree = open(Path::new("/definitely/not/here"));
         assert!(matches!(
-            tree.levels()[0].load,
+            tree.levels()[1].load,
             Load::Failed(io::ErrorKind::NotFound)
         ));
-        assert!(tree.levels()[0].entries.is_empty());
+        assert!(tree.levels()[1].entries.is_empty());
+        assert_eq!(tree.levels()[1].dir, Path::new("/definitely/not/here"));
         assert_eq!(step(&mut tree, |t| t.enter()), None);
+    }
+
+    #[test]
+    fn an_unreadable_parent_keeps_the_directory_below_it() {
+        let tmp = fixture();
+        let mut tree = Tree::new(tmp.path().to_path_buf(), false);
+        let parent = tmp.path().parent().unwrap().to_path_buf();
+        for r in tree.take_requests() {
+            let result = if r.dir == parent {
+                Err(io::Error::from(io::ErrorKind::PermissionDenied))
+            } else {
+                crate::fsread::read_dir(&r.dir, r.keep.as_deref(), r.hidden)
+            };
+            tree.finish_load(&r.dir, result);
+        }
+        tree.settle();
+        assert_eq!(tree.focus(), 1);
+        assert_eq!(tree.focused().dir, tmp.path());
+        assert_eq!(names(tree.focused()), ["alpha", "beta", "file.md"]);
     }
 
     #[test]
@@ -691,7 +828,7 @@ mod tests {
             step(&mut tree, |t| t.enter()),
             Some(Effect::Open(tmp.path().join("file.md")))
         );
-        assert_eq!(tree.focus(), 0);
+        assert_eq!(tree.focus(), 1);
     }
 
     #[test]
@@ -699,9 +836,13 @@ mod tests {
         let tmp = fixture();
         let mut tree = Tree::new(tmp.path().to_path_buf(), false);
         assert!(tree.is_loading());
-        assert!(tree.levels()[0].entries.is_empty());
+        assert!(tree.levels()[1].entries.is_empty());
         tree.move_by(1);
-        assert_eq!(tree.take_requests().len(), 1);
+        assert_eq!(
+            tree.take_requests().len(),
+            2,
+            "the directory and its parent, and nothing waited for"
+        );
     }
 
     #[test]
@@ -711,8 +852,8 @@ mod tests {
         step(&mut tree, |t| t.move_by(1));
         let stale = tmp.path().join("alpha");
         tree.finish_load(&stale, Ok(Vec::new()));
-        assert_eq!(tree.levels().len(), 2);
-        assert_eq!(tree.levels()[1].dir, tmp.path().join("beta"));
+        assert_eq!(tree.levels().len(), 3);
+        assert_eq!(tree.levels()[2].dir, tmp.path().join("beta"));
     }
 
     #[test]
@@ -723,7 +864,7 @@ mod tests {
         fs::create_dir(tmp.path().join("aaa")).unwrap();
         tree.reload(tmp.path());
         tree.settle();
-        let level = &tree.levels()[0];
+        let level = &tree.levels()[1];
         assert_eq!(level.selected().unwrap().display_name(), "beta");
         assert_eq!(level.cursor, 2);
     }
@@ -735,7 +876,7 @@ mod tests {
         fs::write(tmp.path().join("alpha/new.txt"), "").unwrap();
         tree.reload(&tmp.path().join("alpha"));
         tree.settle();
-        assert!(names(&tree.levels()[1]).contains(&"new.txt".to_string()));
+        assert!(names(&tree.levels()[2]).contains(&"new.txt".to_string()));
     }
 
     #[test]
@@ -746,9 +887,9 @@ mod tests {
         fs::remove_dir_all(tmp.path().join("alpha")).unwrap();
         tree.reload(tmp.path());
         tree.settle();
-        assert_eq!(tree.focus(), 0);
-        assert_eq!(tree.levels()[0].selected().unwrap().display_name(), "beta");
-        assert_eq!(tree.levels()[1].dir, tmp.path().join("beta"));
+        assert_eq!(tree.focus(), 1);
+        assert_eq!(tree.levels()[1].selected().unwrap().display_name(), "beta");
+        assert_eq!(tree.levels()[2].dir, tmp.path().join("beta"));
     }
 
     #[test]
@@ -777,6 +918,57 @@ mod tests {
         assert_eq!(preview_lines(&tree), ["hello"]);
         step(&mut tree, |t| t.move_by(-1));
         assert!(tree.preview().is_none());
+    }
+
+    #[test]
+    fn neighbours_are_read_ahead_and_nothing_is_asked_for_twice() {
+        let tmp = crate::testdir::tempdir();
+        for name in [
+            "a.txt", "b.txt", "c.txt", "d.txt", "e.txt", "f.txt", "g.txt",
+        ] {
+            fs::write(tmp.path().join(name), name).unwrap();
+        }
+        let mut tree = open(tmp.path());
+        // Opening read a.txt and the one after it; e.txt is new.
+        tree.set_cursor(4);
+        let wanted = tree.take_preview_requests();
+        assert_eq!(wanted.len(), 1);
+        let ahead: Vec<PathBuf> = tree
+            .take_prefetch_requests()
+            .into_iter()
+            .map(|r| r.path)
+            .collect();
+        assert_eq!(ahead, [tmp.path().join("d.txt"), tmp.path().join("f.txt")]);
+        tree.set_cursor(5);
+        assert!(
+            tree.take_preview_requests().is_empty(),
+            "f.txt is already being read ahead"
+        );
+        tree.set_cursor(4);
+        assert!(
+            tree.take_preview_requests().is_empty(),
+            "nor is e.txt asked again"
+        );
+        let rough = Content {
+            image: None,
+            lines: vec![],
+            numbered: false,
+        };
+        tree.show_provisional(&wanted[0], rough);
+        assert!(matches!(
+            tree.preview().unwrap().state,
+            PreviewState::Ready(_)
+        ));
+        // The cursor moves on before the real preview is made, so the worker skips it.
+        tree.set_cursor(6);
+        let skipped = Err(io::Error::new(io::ErrorKind::Interrupted, "skipped"));
+        tree.finish_preview(&wanted[0], skipped);
+        tree.set_cursor(4);
+        assert_eq!(
+            tree.take_preview_requests().len(),
+            1,
+            "the rough preview was not kept, so e.txt is read again"
+        );
     }
 
     #[test]
@@ -892,13 +1084,13 @@ mod tests {
         fs::write(tmp.path().join("alpha/.secret"), "").unwrap();
         let mut tree = open(tmp.path());
         step(&mut tree, |t| t.enter());
-        assert!(!names(&tree.levels()[1]).contains(&".secret".to_string()));
+        assert!(!names(&tree.levels()[2]).contains(&".secret".to_string()));
         step(&mut tree, |t| t.set_show_hidden(true));
-        assert!(names(&tree.levels()[0]).contains(&".hidden".to_string()));
-        assert!(names(&tree.levels()[1]).contains(&".secret".to_string()));
+        assert!(names(&tree.levels()[1]).contains(&".hidden".to_string()));
+        assert!(names(&tree.levels()[2]).contains(&".secret".to_string()));
         assert_eq!(tree.focused().selected().unwrap().display_name(), "inner");
         step(&mut tree, |t| t.set_show_hidden(false));
-        assert!(!names(&tree.levels()[0]).contains(&".hidden".to_string()));
+        assert!(!names(&tree.levels()[1]).contains(&".hidden".to_string()));
         assert!(tree.take_requests().is_empty());
     }
 
@@ -909,7 +1101,7 @@ mod tests {
         let mut tree = Tree::new(tmp.path().to_path_buf(), true);
         tree.settle();
         step(&mut tree, |t| t.move_by(1));
-        assert_eq!(names(&tree.levels()[1]), [".dot"]);
+        assert_eq!(names(&tree.levels()[2]), [".dot"]);
     }
 
     #[test]
@@ -940,7 +1132,7 @@ mod tests {
             tree.location(),
             tmp.path().join("alpha/inner/deep/target.txt")
         );
-        assert_eq!(tree.focus(), 3);
+        assert_eq!(tree.focus(), 4);
         assert_eq!(preview_lines(&tree), ["found"]);
     }
 
@@ -951,18 +1143,18 @@ mod tests {
         tree.reveal(&tmp.path().join("alpha/inner"));
         tree.settle();
         assert_eq!(tree.location(), tmp.path().join("alpha/inner"));
-        assert_eq!(tree.focus(), 1);
+        assert_eq!(tree.focus(), 2);
     }
 
     #[test]
     fn reveal_outside_the_root_re_roots_at_the_parent() {
         let tmp = fixture();
-        let other = tempfile::tempdir().unwrap();
+        let other = crate::testdir::tempdir();
         fs::write(other.path().join("x.txt"), "x").unwrap();
         let mut tree = open(tmp.path());
         tree.reveal(&other.path().join("x.txt"));
         tree.settle();
-        assert_eq!(tree.levels()[0].dir, other.path());
+        assert_eq!(tree.levels()[1].dir, other.path());
         assert_eq!(tree.location(), other.path().join("x.txt"));
     }
 
@@ -983,7 +1175,7 @@ mod tests {
         let mut tree = open(tmp.path());
         tree.reveal(tmp.path());
         tree.settle();
-        assert_eq!(tree.levels()[0].dir, tmp.path().parent().unwrap());
+        assert_eq!(tree.levels()[1].dir, tmp.path().parent().unwrap());
         assert_eq!(tree.location(), tmp.path());
     }
 

@@ -12,6 +12,7 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 imagesize = "0.15.0"
 infer = "0.22.0"
 jpeg-decoder = "0.3.2"
+kamadak-exif = "0.6.1"
 notify = "8.2.0"
 ratatui = "0.30.2"
 ratatui-image = { version = "11.1.0", default-features = false, features = ["crossterm"] }
@@ -32,6 +33,10 @@ portable-pty = "0.9.0"
 tempfile = "3.27.0"
 vt100 = "0.16.2"
 
+# Dependencies are optimised even in debug builds: unoptimised decoders take seconds a picture.
+[profile.dev.package."*"]
+opt-level = 3
+
 # Smallest binary for distribution: cargo build --profile dist
 [profile.dist]
 inherits = "release"
@@ -39,3 +44,21 @@ opt-level = "s"
 lto = "fat"
 codegen-units = 1
 strip = true
+
+# Except the picture code, which runs 20-200% slower when optimised for size.
+[profile.dist.package.image]
+opt-level = 3
+[profile.dist.package.zune-jpeg]
+opt-level = 3
+[profile.dist.package.jpeg-decoder]
+opt-level = 3
+[profile.dist.package.png]
+opt-level = 3
+[profile.dist.package.fdeflate]
+opt-level = 3
+[profile.dist.package.miniz_oxide]
+opt-level = 3
+[profile.dist.package.base64-simd]
+opt-level = 3
+[profile.dist.package.ratatui-image]
+opt-level = 3

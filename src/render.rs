@@ -19,6 +19,8 @@ use crate::{
 const MIN_WIDTH: u16 = 16;
 const MAX_WIDTH: u16 = 40;
 const META_WIDTH: u16 = 6;
+/// Blank cells between a picture and the info lines beside it.
+const PANEL_GAP: u16 = 2;
 const WARN: (u8, u8, u8) = (0xff, 0x9e, 0x64);
 /// A listing faster than this never flashes a loading label.
 const LOADING_LABEL_DELAY: Duration = Duration::from_millis(120);
@@ -53,13 +55,7 @@ pub fn render(app: &App, area: Rect, buf: &mut Buffer) {
     let content = editor.is_some() || preview.is_some();
     // Always three columns: the parent, the focused level and what is under the cursor.
     let first = focus.saturating_sub(1);
-    let mut placed = layout::place(
-        &widths[first..],
-        content,
-        tree.width,
-        focus - first,
-        app.tree_width(),
-    );
+    let mut placed = layout::place(&widths[first..], content, tree.width);
     for p in &mut placed {
         p.level += first;
     }
@@ -104,6 +100,13 @@ pub fn render(app: &App, area: Rect, buf: &mut Buffer) {
         draw_column(buf, tree, center, *p, &levels[p.level], role, &marks);
     }
     for pair in placed.windows(2) {
+        // A brace starts at the cursor row of the level on its left, which a listing still on its way does not have yet.
+        if levels
+            .get(pair[0].level)
+            .is_some_and(|l| matches!(l.load, Load::Loading { .. }))
+        {
+            continue;
+        }
         let (spec, color) = match (levels.get(pair[1].level), editor, preview) {
             (Some(child), _, _) => (
                 layout::brace(tree.height, center, child.entries.len(), child.cursor),
@@ -349,27 +352,72 @@ fn preview_color(preview: &FilePreview) -> (u8, u8, u8) {
 
 fn preview_lines(preview: &FilePreview, painter: &Painter, width: u16, height: u16) -> usize {
     match &preview.state {
-        PreviewState::Ready(content) => match image_size(content, painter, width, height) {
-            Some(size) => usize::from(size.height) + 1 + content.lines.len(),
+        PreviewState::Ready(content) => match picture_layout(content, painter, width, height) {
+            Some(layout) => layout.rows,
             None => content.lines.len().max(1),
         },
         _ => 1,
     }
 }
 
-/// Cells a preview's picture takes in a column, leaving room under it for the info lines.
-fn image_size(
+/// Where a preview's picture and its info lines sit in a column.
+struct PictureLayout {
+    picture: ratatui::layout::Size,
+    /// Where the info lines start, relative to the picture's top left corner.
+    info: (u16, u16),
+    /// Rows the picture and its info take together.
+    rows: usize,
+}
+
+/// Fits the picture into a column with its info lines beside it or under it, whichever leaves the
+/// picture more cells, and beside it when both do the same.
+fn picture_layout(
     content: &Content,
     painter: &Painter,
     width: u16,
     height: u16,
-) -> Option<ratatui::layout::Size> {
+) -> Option<PictureLayout> {
     let image = content.image.as_ref()?;
-    let room = height.saturating_sub(content.lines.len() as u16 + 1);
-    painter.fitted_size(
-        image,
-        ratatui::layout::Size::new(width.saturating_sub(1), room),
-    )
+    let lines = content.lines.len();
+    let room = width.saturating_sub(1);
+    let below = painter
+        .fitted_size(
+            image,
+            ratatui::layout::Size::new(room, height.saturating_sub(lines as u16 + 1)),
+        )
+        .map(|picture| PictureLayout {
+            picture,
+            info: (0, picture.height + 1),
+            rows: usize::from(picture.height) + 1 + lines,
+        });
+    let panel = content
+        .lines
+        .iter()
+        .map(|l| l.text().width())
+        .max()
+        .unwrap_or(0) as u16
+        + PANEL_GAP;
+    let beside = (usize::from(height) >= lines)
+        .then(|| {
+            painter.fitted_size(
+                image,
+                ratatui::layout::Size::new(room.checked_sub(panel)?, height),
+            )
+        })
+        .flatten()
+        .map(|picture| PictureLayout {
+            picture,
+            info: (
+                picture.width + PANEL_GAP,
+                picture.height.saturating_sub(lines as u16) / 2,
+            ),
+            rows: usize::from(picture.height).max(lines),
+        });
+    let cells = |l: &PictureLayout| l.picture.width * l.picture.height;
+    match (below, beside) {
+        (Some(below), Some(beside)) if cells(&beside) >= cells(&below) => Some(beside),
+        (below, beside) => below.or(beside),
+    }
 }
 
 fn gutter_width(content: &Content) -> u16 {
@@ -387,6 +435,7 @@ fn draw_preview(
     preview: &FilePreview,
     painter: &Painter,
 ) {
+    painter.note_room(p.width.saturating_sub(1), tree.height);
     let color = preview_color(preview);
     let x = tree.x + p.x;
     let note = |buf: &mut Buffer, text: &str| {
@@ -408,20 +457,19 @@ fn draw_preview(
         }
         PreviewState::Ready(content) => content,
     };
-    if let (Some(image), Some(size)) = (
+    if let (Some(image), Some(fit)) = (
         &content.image,
-        image_size(content, painter, p.width, tree.height),
+        picture_layout(content, painter, p.width, tree.height),
     ) {
-        let total = usize::from(size.height) + 1 + content.lines.len();
-        let (top, _) = layout::block_rows(tree.height, center, total);
-        let area = Rect::new(x + 1, tree.y + top, size.width, size.height);
+        let (top, _) = layout::block_rows(tree.height, center, fit.rows);
+        let area = Rect::new(x + 1, tree.y + top, fit.picture.width, fit.picture.height);
         painter.draw(&preview.path, image, area, buf);
         for (i, line) in content.lines.iter().enumerate() {
-            let y = tree.y + top + size.height + 1 + i as u16;
+            let y = tree.y + top + fit.info.1 + i as u16;
             if y >= tree.bottom() {
                 break;
             }
-            let mut cx = x + 1;
+            let mut cx = x + 1 + fit.info.0;
             for span in &line.0 {
                 let end = x + p.width;
                 if cx >= end {
@@ -848,8 +896,8 @@ mod tests {
         }
     }
 
-    fn fixture() -> tempfile::TempDir {
-        let tmp = tempfile::tempdir().unwrap();
+    fn fixture() -> crate::testdir::TestDir {
+        let tmp = crate::testdir::tempdir();
         let r = tmp.path();
         fs::create_dir_all(r.join("alpha/inner")).unwrap();
         fs::create_dir_all(r.join("beta")).unwrap();
@@ -929,8 +977,8 @@ mod tests {
     }
 
     #[test]
-    fn a_deep_path_in_a_narrow_terminal_keeps_the_focus_visible_inside_the_screen() {
-        let tmp = tempfile::tempdir().unwrap();
+    fn a_deep_path_in_a_narrow_terminal_keeps_all_three_levels_on_screen() {
+        let tmp = crate::testdir::tempdir();
         let deep = tmp
             .path()
             .join("aaaaaaaaaaaa/bbbbbbbbbbbb/cccccccccccc/dddddddddddd/eeeeeeeeeeee");
@@ -940,25 +988,29 @@ mod tests {
         for _ in 0..5 {
             keys(&mut app, "l");
         }
-        assert_eq!(app.tree().focus(), 5);
+        assert_eq!(app.tree().focus(), 6);
         let (lines, _) = rows(&app, 50, 9);
         let center = &lines[4];
         assert!(
-            center.starts_with(" leaf/"),
-            "focused level must be the leftmost column: {center:?}"
+            center.starts_with(" eeee"),
+            "the parent is the leftmost column, shrunk rather than dropped: {center:?}"
+        );
+        assert!(
+            center.contains("leaf/"),
+            "the focus stays visible: {center:?}"
         );
         assert!(
             center.contains("(empty)"),
             "the preview of leaf/ stays visible: {center:?}"
         );
         assert!(
-            !center.contains("aaaaaaaaaaaa/"),
-            "ancestors that do not fit scroll off: {center:?}"
+            !center.contains("dddd"),
+            "levels above the parent are not shown: {center:?}"
         );
         let (wide, _) = rows(&app, 140, 9);
         assert!(
             wide[4].contains("eeeeeeeeeeee/"),
-            "the parent returns once it fits: {:?}",
+            "the parent is whole once it fits: {:?}",
             wide[4]
         );
         assert!(lines.iter().all(|l| l.chars().count() == 50));
@@ -969,7 +1021,11 @@ mod tests {
         let tmp = fixture();
         let app = open(tmp.path());
         let (lines, buf) = rows(&app, 100, 11);
-        assert!(lines[5].starts_with(" alpha/"), "{:?}", lines[5]);
+        assert!(
+            lines[5].starts_with(" root/"),
+            "the parent of the start: {:?}",
+            lines[5]
+        );
         assert_ne!(
             buf[(0, 5)].bg,
             theme::rgb(BG),
@@ -1073,7 +1129,7 @@ mod tests {
 
     #[test]
     fn a_file_under_the_cursor_is_previewed_beside_a_brace_with_line_numbers() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::testdir::tempdir();
         fs::write(tmp.path().join("hello.txt"), "alpha\nbeta\ngamma\n").unwrap();
         let app = open(tmp.path());
         let (lines, _) = rows(&app, 80, 11);
@@ -1096,7 +1152,7 @@ mod tests {
 
     #[test]
     fn a_long_file_fills_the_height_and_its_brace_stays_open_at_the_bottom() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::testdir::tempdir();
         numbered_file(tmp.path(), "long.txt", 200);
         let app = open(tmp.path());
         let (lines, _) = rows(&app, 80, 15);
@@ -1119,7 +1175,7 @@ mod tests {
 
     #[test]
     fn capital_j_and_k_scroll_the_preview() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::testdir::tempdir();
         numbered_file(tmp.path(), "long.txt", 200);
         let mut app = open(tmp.path());
         app.set_viewport(13);
@@ -1158,7 +1214,7 @@ mod tests {
 
     #[test]
     fn syntax_colors_reach_the_screen() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::testdir::tempdir();
         fs::write(tmp.path().join("a.rs"), "fn main() { let x = 1; }\n").unwrap();
         let app = open(tmp.path());
         let (lines, buf) = rows(&app, 80, 11);
@@ -1171,7 +1227,7 @@ mod tests {
 
     #[test]
     fn a_failed_preview_says_why() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::testdir::tempdir();
         fs::write(tmp.path().join("bad.zip"), b"not a zip").unwrap();
         let app = open(tmp.path());
         let (lines, _) = rows(&app, 80, 11);
@@ -1181,8 +1237,8 @@ mod tests {
         );
     }
 
-    fn plain_files() -> tempfile::TempDir {
-        let tmp = tempfile::tempdir().unwrap();
+    fn plain_files() -> crate::testdir::TestDir {
+        let tmp = crate::testdir::tempdir();
         for f in ["a.txt", "b.txt", "c.txt", "d.txt"] {
             fs::write(tmp.path().join(f), f).unwrap();
         }
@@ -1199,18 +1255,13 @@ mod tests {
         let mut app = open(tmp.path());
         keys(&mut app, "<space><space>");
         let (lines, _) = rows(&app, 80, 15);
-        assert!(
-            lines[row_of(&lines, "a.txt")].starts_with('●'),
-            "{lines:#?}"
-        );
-        assert!(
-            lines[row_of(&lines, "b.txt")].starts_with('●'),
-            "{lines:#?}"
-        );
-        assert!(
-            lines[row_of(&lines, "c.txt")].starts_with(' '),
-            "{lines:#?}"
-        );
+        let before = |name: &str| {
+            let line = &lines[row_of(&lines, name)];
+            line[..line.find(name).unwrap()].chars().last().unwrap()
+        };
+        assert_eq!(before("a.txt"), '●', "{lines:#?}");
+        assert_eq!(before("b.txt"), '●', "{lines:#?}");
+        assert_eq!(before("c.txt"), ' ', "{lines:#?}");
     }
 
     #[test]
@@ -1224,15 +1275,19 @@ mod tests {
             row_of(&lines, "b.txt") as u16,
             row_of(&lines, "c.txt") as u16,
         );
-        assert_ne!(buf[(5, a)].bg, theme::rgb(BG), "anchor row is tinted");
-        assert_ne!(buf[(5, b)].bg, theme::rgb(BG), "cursor row is filled");
+        let x = lines[a as usize][..lines[a as usize].find("a.txt").unwrap()]
+            .chars()
+            .count() as u16
+            + 2;
+        assert_ne!(buf[(x, a)].bg, theme::rgb(BG), "anchor row is tinted");
+        assert_ne!(buf[(x, b)].bg, theme::rgb(BG), "cursor row is filled");
         assert_ne!(
-            buf[(5, a)].bg,
-            buf[(5, b)].bg,
+            buf[(x, a)].bg,
+            buf[(x, b)].bg,
             "the cursor row is stronger than the range"
         );
         assert_eq!(
-            buf[(5, c)].bg,
+            buf[(x, c)].bg,
             theme::rgb(BG),
             "rows outside the range are untouched"
         );
@@ -1293,8 +1348,8 @@ mod tests {
         );
     }
 
-    fn edit(content: &str) -> (tempfile::TempDir, App) {
-        let tmp = tempfile::tempdir().unwrap();
+    fn edit(content: &str) -> (crate::testdir::TestDir, App) {
+        let tmp = crate::testdir::tempdir();
         fs::write(tmp.path().join("code.rs"), content).unwrap();
         let mut app = open(tmp.path());
         keys(&mut app, "l");
@@ -1387,7 +1442,7 @@ mod tests {
 
     #[test]
     fn the_tree_keeps_to_its_share_of_the_width_and_the_preview_fills_the_rest() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::testdir::tempdir();
         let deep = tmp
             .path()
             .join("aaaaaaaaaaaaaaaaaa/bbbbbbbbbbbbbbbbbb/cccccccccccccccccc");
@@ -1457,16 +1512,17 @@ mod tests {
 
     #[test]
     fn a_picture_is_drawn_in_the_preview_with_its_card_under_it() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::testdir::tempdir();
         write_png(&tmp.path().join("photo.png"), 200, 100);
         let app = open(tmp.path());
-        let (lines, buf) = rows(&app, 100, 30);
+        // Too narrow for the card to fit beside the picture.
+        let (lines, buf) = rows(&app, 80, 30);
         let card = row_of(&lines, "image/png");
         assert!(lines[card].contains("200×100"), "{lines:#?}");
         let tip = row_of(&lines, "─┤");
         let brace_x = lines[tip].chars().position(|c| c == '┤').unwrap() as u16;
-        let reds_and_blues: Vec<_> = (brace_x + 3..100)
-            .map(|x| buf[(x, (card - 2) as u16)].fg)
+        let reds_and_blues: Vec<_> = (brace_x + 3..80)
+            .map(|x| buf[(x, (card - 2) as u16)].bg)
             .filter(|c| *c != theme::rgb(BG) && *c != ratatui::style::Color::Reset)
             .collect();
         assert!(
@@ -1481,8 +1537,35 @@ mod tests {
     }
 
     #[test]
+    fn a_tall_picture_in_a_wide_column_has_its_card_beside_it() {
+        let tmp = crate::testdir::tempdir();
+        write_png(&tmp.path().join("photo.png"), 100, 300);
+        let app = open(tmp.path());
+        let (lines, buf) = rows(&app, 140, 30);
+        let card = row_of(&lines, "image/png");
+        let tip = row_of(&lines, "─┤");
+        let brace_x = lines[tip].chars().position(|c| c == '┤').unwrap() as u16;
+        let card_x = lines[card][..lines[card].find("type").unwrap()]
+            .chars()
+            .count() as u16;
+        let picture: Vec<_> = (brace_x + 3..card_x)
+            .map(|x| buf[(x, card as u16)].fg)
+            .filter(|c| *c != theme::rgb(BG) && *c != ratatui::style::Color::Reset)
+            .collect();
+        assert!(
+            picture.len() > 3,
+            "the picture fills the row to the left of the card: {lines:#?}"
+        );
+        let histogram = row_of(&lines, "█");
+        assert!(
+            lines[histogram].find('█').unwrap() > lines[histogram].find('▀').unwrap_or(0),
+            "the histogram sits beside the picture too: {lines:#?}"
+        );
+    }
+
+    #[test]
     fn with_images_off_a_picture_shows_only_its_card() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::testdir::tempdir();
         write_png(&tmp.path().join("photo.png"), 20, 10);
         let mut app = App::with_settings(
             tmp.path().to_path_buf(),
@@ -1548,7 +1631,7 @@ mod tests {
 
     #[test]
     fn entries_far_from_the_cursor_keep_their_full_colour() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::testdir::tempdir();
         for i in 0..8 {
             fs::write(tmp.path().join(format!("f{i}.txt")), "x").unwrap();
         }

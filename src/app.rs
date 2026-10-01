@@ -103,8 +103,6 @@ pub struct Settings {
     /// Draws pictures in the preview.
     pub painter: Painter,
     pub depth: crate::theme::Depth,
-    /// Percent of the width the folder columns may use.
-    pub tree_width: u8,
     pub marks: Marks,
     pub trash: Arc<dyn Trasher>,
 }
@@ -115,7 +113,6 @@ impl Default for Settings {
             show_hidden: false,
             painter: Painter::blocks(),
             depth: crate::theme::Depth::TrueColor,
-            tree_width: 50,
             marks: Marks::default(),
             trash: Arc::new(NoTrash),
         }
@@ -145,7 +142,6 @@ pub struct App {
     pending_focus: Option<PathBuf>,
     /// Where the last jump started, for `''`.
     previous: Option<PathBuf>,
-    tree_width: u8,
     painter: Painter,
     depth: crate::theme::Depth,
     hitmap: std::cell::RefCell<HitMap>,
@@ -175,7 +171,6 @@ impl App {
             files: FileOps::new(settings.trash),
             pending_focus: None,
             previous: None,
-            tree_width: settings.tree_width,
             painter: settings.painter,
             depth: settings.depth,
             hitmap: std::cell::RefCell::default(),
@@ -315,8 +310,8 @@ impl App {
         &self.painter
     }
 
-    pub fn tree_width(&self) -> u8 {
-        self.tree_width
+    pub fn painter_mut(&mut self) -> &mut Painter {
+        &mut self.painter
     }
 
     pub fn editor(&self) -> Option<&Editor> {
@@ -465,7 +460,11 @@ impl App {
                 let result = crate::fsread::read_dir(&r.dir, r.keep.as_deref(), r.hidden);
                 self.finish_load(&r.dir, result);
             }
-            for r in self.tree.take_preview_requests() {
+            let previews = self.tree.take_preview_requests();
+            for r in previews
+                .into_iter()
+                .chain(self.tree.take_prefetch_requests())
+            {
                 progressed = true;
                 let result = crate::preview::build(&r.path);
                 self.tree.finish_preview(&r, result);
@@ -1380,8 +1379,8 @@ mod tests {
 
     use super::*;
 
-    fn fixture() -> tempfile::TempDir {
-        let tmp = tempfile::tempdir().unwrap();
+    fn fixture() -> crate::testdir::TestDir {
+        let tmp = crate::testdir::tempdir();
         for d in ["docs", "src", "target"] {
             fs::create_dir(tmp.path().join(d)).unwrap();
         }
@@ -1447,7 +1446,7 @@ mod tests {
 
     #[test]
     fn page_motions_scale_with_the_viewport_and_count() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::testdir::tempdir();
         for i in 0..100 {
             fs::write(tmp.path().join(format!("f{i:03}")), "").unwrap();
         }
@@ -1483,7 +1482,7 @@ mod tests {
 
     #[test]
     fn a_letter_that_is_a_command_can_still_be_jumped_to() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::testdir::tempdir();
         for f in ["alpha", "quokka", "zulu"] {
             fs::write(tmp.path().join(f), "").unwrap();
         }
@@ -1497,10 +1496,11 @@ mod tests {
         let tmp = fixture();
         let mut app = open(tmp.path());
         keys(&mut app, "j2l");
-        assert_eq!(app.tree().focus(), 2, "src then deep");
+        assert_eq!(app.tree().focus(), 3, "src then deep");
         assert_eq!(app.tree().current_dir(), tmp.path().join("src/deep"));
         keys(&mut app, "2h");
-        assert_eq!(app.tree().focus(), 0);
+        assert_eq!(app.tree().focus(), 1);
+        assert_eq!(app.tree().current_dir(), tmp.path());
     }
 
     #[test]
@@ -1577,7 +1577,7 @@ mod tests {
         let tmp = fixture();
         let mut app = open(tmp.path());
         keys(&mut app, "/src");
-        let preview = &app.tree().levels()[1];
+        let preview = &app.tree().levels()[2];
         assert_eq!(preview.dir, tmp.path().join("src"));
         assert!(
             preview
@@ -1613,7 +1613,7 @@ mod tests {
         let mut app = open(tmp.path());
         keys(&mut app, "/jjq");
         assert_eq!(app.prompt_view().unwrap().text, "jjq");
-        assert_eq!(app.tree().focus(), 0);
+        assert_eq!(app.tree().focus(), 1);
     }
 
     #[test]
@@ -1794,7 +1794,7 @@ mod tests {
         assert_eq!(here(&app), tmp.path().join("docs"));
         keys(&mut app, "'a");
         assert_eq!(here(&app), tmp.path().join("src/deep/leaf.txt"));
-        assert_eq!(app.tree().focus(), 2);
+        assert_eq!(app.tree().focus(), 3);
     }
 
     #[test]
@@ -1844,7 +1844,7 @@ mod tests {
     #[test]
     fn uppercase_marks_survive_a_restart_and_lowercase_ones_do_not() {
         let tmp = fixture();
-        let state = tempfile::tempdir().unwrap();
+        let state = crate::testdir::tempdir();
         let file = state.path().join("marks");
         let mut app = App::with_settings(
             tmp.path().to_path_buf(),
@@ -1874,7 +1874,7 @@ mod tests {
     #[test]
     fn a_mark_outside_the_current_root_re_roots_the_tree() {
         let tmp = fixture();
-        let other = tempfile::tempdir().unwrap();
+        let other = crate::testdir::tempdir();
         fs::write(other.path().join("far.txt"), "x").unwrap();
         let mut app = open(tmp.path());
         app.marks.set('F', other.path().join("far.txt")).unwrap();
@@ -1940,7 +1940,9 @@ mod tests {
         keys(&mut app, "3j");
         assert_eq!(selected(&app), "Cargo.toml");
         keys(&mut app, "zh");
-        let names: Vec<_> = app.tree().levels()[0]
+        let names: Vec<_> = app
+            .tree()
+            .focused()
             .entries
             .iter()
             .map(|e| e.display_name())
@@ -1993,9 +1995,9 @@ mod tests {
     }
 
     struct Files {
-        root: tempfile::TempDir,
+        root: crate::testdir::TestDir,
         trash: Arc<crate::ops::FakeTrash>,
-        _trash_dir: tempfile::TempDir,
+        _trash_dir: crate::testdir::TestDir,
         app: App,
     }
 
@@ -2029,7 +2031,7 @@ mod tests {
 
     /// dir1/ dir2/ a.txt b.txt c.txt, with a fake trash so no real one is touched.
     fn files() -> Files {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::testdir::tempdir();
         for d in ["dir1", "dir2"] {
             fs::create_dir(root.path().join(d)).unwrap();
         }
@@ -2037,7 +2039,7 @@ mod tests {
         for f in ["a.txt", "b.txt", "c.txt"] {
             fs::write(root.path().join(f), format!("content of {f}")).unwrap();
         }
-        let trash_dir = tempfile::tempdir().unwrap();
+        let trash_dir = crate::testdir::tempdir();
         let trash = Arc::new(crate::ops::FakeTrash::new(&trash_dir.path().join("t")));
         let mut app = App::with_settings(
             root.path().to_path_buf(),
@@ -2406,7 +2408,7 @@ mod tests {
 
     #[test]
     fn a_file_operation_that_fails_says_what_and_how_far_it_got() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::testdir::tempdir();
         fs::write(root.path().join("a.txt"), "x").unwrap();
         let mut app = App::new(root.path().to_path_buf(), Keymap::default());
         app.settle();
@@ -2481,15 +2483,15 @@ mod tests {
         assert_eq!(f.app.message.as_deref(), Some("nothing to change"));
     }
 
-    fn editing(content: &str) -> (tempfile::TempDir, App) {
-        let root = tempfile::tempdir().unwrap();
+    fn editing(content: &str) -> (crate::testdir::TestDir, App) {
+        let root = crate::testdir::tempdir();
         fs::write(root.path().join("notes.txt"), content).unwrap();
         let mut app = open(root.path());
         keys(&mut app, "l");
         (root, app)
     }
 
-    fn on_disk(root: &tempfile::TempDir) -> String {
+    fn on_disk(root: &crate::testdir::TestDir) -> String {
         fs::read_to_string(root.path().join("notes.txt")).unwrap()
     }
 
@@ -2623,7 +2625,7 @@ mod tests {
 
     #[test]
     fn binaries_and_huge_files_go_to_the_external_opener_instead() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::testdir::tempdir();
         fs::write(root.path().join("bin"), b"\x7fELF\0\0").unwrap();
         fs::write(
             root.path().join("big"),
@@ -2699,14 +2701,14 @@ mod tests {
         let lines = draw(&app);
         let (x, y) = cell_of(&lines, "main.rs");
         app.mouse(MouseAction::Click, x, y);
-        assert_eq!(app.tree().focus(), 1);
+        assert_eq!(app.tree().focus(), 2);
         assert_eq!(selected(&app), "main.rs");
         let lines = draw(&app);
         let (x, y) = cell_of(&lines, "docs/");
         app.mouse(MouseAction::Click, x, y);
         assert_eq!(
             app.tree().focus(),
-            0,
+            1,
             "clicking a parent column goes back to it"
         );
         assert_eq!(selected(&app), "docs");

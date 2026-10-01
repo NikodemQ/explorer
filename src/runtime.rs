@@ -51,6 +51,8 @@ enum Msg {
     Input(Event),
     Loaded(PathBuf, io::Result<Vec<Entry>>),
     Previewed(PreviewRequest, io::Result<Content>),
+    /// A rough first preview to show until the real one arrives, not to be kept.
+    Provisional(PreviewRequest, Content),
     JobProgress(u64, u64, u64),
     JobDone(u64, Outcome),
     Encoded(crate::imageview::Key, Option<crate::imageview::Encoded>),
@@ -67,12 +69,17 @@ pub fn run(terminal: &mut DefaultTerminal, app: &mut App, config: &Config) -> io
     let encoder = spawn_encoder(tx.clone());
     let wanted: Wanted = Arc::default();
     let previewer = spawn_previewers(tx.clone(), Arc::clone(&wanted));
+    let nearby: Nearby = Arc::default();
+    let prefetcher = spawn_prefetcher(tx.clone(), Arc::clone(&nearby));
+    thread::spawn(preview::warm);
     let worker = spawn_job_worker(tx.clone(), app.trasher());
     spawn_signal_listener(tx.clone());
     let mut last_image: Option<crate::imageview::Drawn> = None;
     let mut watcher = DirWatcher::new(tx);
     let mut dirty: HashSet<PathBuf> = HashSet::new();
     let mut flush_at: Option<Instant> = None;
+    // Whether anything may have changed what the screen shows since it was last drawn.
+    let mut redraw = true;
 
     loop {
         if flush_at.is_some_and(|t| t <= Instant::now()) {
@@ -87,26 +94,48 @@ pub fn run(terminal: &mut DefaultTerminal, app: &mut App, config: &Config) -> io
         for job in app.take_jobs() {
             let _ = worker.send(job);
         }
-        let requests = app.tree_mut().take_preview_requests();
-        if let Some(last) = requests.last() {
-            *wanted.lock().unwrap() = Some(last.path.clone());
-        }
-        for request in requests {
+        *wanted.lock().unwrap() = app.tree().preview().map(|p| p.path.clone());
+        *nearby.lock().unwrap() = app.tree().nearby();
+        for request in app.tree_mut().take_preview_requests() {
             let _ = previewer.send(request);
         }
-        watcher.sync(app.tree().dirs());
-        app.set_viewport(terminal.size()?.height.saturating_sub(2));
-        terminal.draw(|frame| render::render(app, frame.area(), frame.buffer_mut()))?;
-        let drawn = app.painter().take_drawn();
-        if app.painter().leaves_ghosts() && last_image.is_some() && drawn != last_image {
-            // Sixel and iTerm2 pixels can outlive the text drawn over them, so repaint everything.
-            terminal.clear()?;
-            terminal.draw(|frame| render::render(app, frame.area(), frame.buffer_mut()))?;
-            app.painter().take_drawn();
+        for request in app.tree_mut().take_prefetch_requests() {
+            let _ = prefetcher.send(request);
         }
-        last_image = drawn;
-        for job in app.painter().take_jobs() {
-            let _ = encoder.send(job);
+        watcher.sync(app.tree().dirs());
+        if redraw {
+            app.set_viewport(terminal.size()?.height.saturating_sub(2));
+            let painter = app.painter();
+            let mut drawn = None;
+            terminal.draw(|frame| {
+                render::render(app, frame.area(), frame.buffer_mut());
+                drawn = painter.take_drawn();
+                // Encoding starts now rather than after this frame, which may carry a big picture.
+                for job in painter.take_jobs() {
+                    let _ = encoder.send(job);
+                }
+                if painter.overwriting_erases() && drawn != last_image {
+                    wipe_leftovers(frame.buffer_mut(), last_image.as_ref(), drawn.as_ref());
+                }
+            })?;
+            if painter.leaves_ghosts()
+                && !painter.overwriting_erases()
+                && last_image.is_some()
+                && drawn != last_image
+            {
+                // Sixel pixels can outlive the text drawn over them, so repaint everything. Resizing
+                // to the same size clears without `Terminal::clear` asking where the cursor is, an
+                // answer that only comes once the terminal has digested the picture just sent.
+                let size = terminal.size()?;
+                terminal.resize(ratatui::layout::Rect::new(0, 0, size.width, size.height))?;
+                terminal.draw(|frame| render::render(app, frame.area(), frame.buffer_mut()))?;
+                painter.take_drawn();
+            }
+            last_image = drawn;
+            // Pictures read from now on are decoded for the room the column really has.
+            if let Some((width, height)) = painter.take_decode_target() {
+                preview::set_image_target(width, height);
+            }
         }
 
         let wait = [
@@ -131,7 +160,10 @@ pub fn run(terminal: &mut DefaultTerminal, app: &mut App, config: &Config) -> io
                 Err(_) => return Ok(Exit::Abort),
             },
         };
-        for msg in first.into_iter().chain(rx.try_iter().collect::<Vec<_>>()) {
+        let batch: Vec<Msg> = first.into_iter().chain(rx.try_iter()).collect();
+        // Mouse motion is reported all the time and changes nothing on screen.
+        redraw = batch.is_empty() || !batch.iter().all(is_idle_mouse);
+        for msg in batch {
             match msg {
                 Msg::Terminate => return Ok(Exit::Abort),
                 Msg::Encoded(key, encoded) => app.painter().store(key, encoded),
@@ -141,6 +173,7 @@ pub fn run(terminal: &mut DefaultTerminal, app: &mut App, config: &Config) -> io
                         && key.modifiers.contains(KeyModifiers::CONTROL) =>
                 {
                     suspend(terminal, &gate, config.mouse)?;
+                    app.painter().forget_uploads();
                 }
                 Msg::Input(Event::Key(key)) if key.kind == KeyEventKind::Press => {
                     let response = app.press(Key::from_event(key));
@@ -177,9 +210,13 @@ pub fn run(terminal: &mut DefaultTerminal, app: &mut App, config: &Config) -> io
                         }
                     }
                 }
+                Msg::Input(Event::Resize(..)) => app.painter_mut().follow_resize(),
                 Msg::Input(_) => {}
                 Msg::Loaded(dir, result) => app.finish_load(&dir, result),
                 Msg::Previewed(request, result) => app.tree_mut().finish_preview(&request, result),
+                Msg::Provisional(request, content) => {
+                    app.tree_mut().show_provisional(&request, content);
+                }
                 Msg::JobProgress(id, done, total) => app.job_progress(id, done, total),
                 Msg::JobDone(id, outcome) => app.finish_job(id, outcome),
                 Msg::FsChange(paths) => {
@@ -227,6 +264,31 @@ fn open(
     };
     if let Err(e) = outcome {
         app.message = Some(format!("{}: {e}", path.display()));
+    }
+    app.painter().forget_uploads();
+}
+
+fn is_idle_mouse(msg: &Msg) -> bool {
+    use ratatui::crossterm::event::MouseEventKind;
+    matches!(msg, Msg::Input(Event::Mouse(m))
+        if matches!(m.kind, MouseEventKind::Moved | MouseEventKind::Up(_) | MouseEventKind::Drag(_)))
+}
+
+/// Marks the cells a picture covered and the next frame leaves to text, so they are written even
+/// where the text has not changed, which erases what is left of the picture under them.
+fn wipe_leftovers(
+    buf: &mut ratatui::buffer::Buffer,
+    old: Option<&crate::imageview::Drawn>,
+    new: Option<&crate::imageview::Drawn>,
+) {
+    let Some(old) = old else { return };
+    let covered = new.map(|d| d.area).unwrap_or_default();
+    for position in old.area.positions() {
+        if !covered.contains(position)
+            && let Some(cell) = buf.cell_mut(position)
+        {
+            cell.set_diff_option(ratatui::buffer::CellDiffOption::AlwaysUpdate);
+        }
     }
 }
 
@@ -417,16 +479,19 @@ fn spawn_previewers(msgs: Sender<Msg>, wanted: Wanted) -> Sender<PreviewRequest>
                 // the column in about a millisecond; the full decode replaces it when it lands.
                 let quick = std::panic::catch_unwind(|| preview::build_quick(&request.path))
                     .unwrap_or(None);
-                if let Some(content) = quick {
-                    if msgs
-                        .send(Msg::Previewed(request.clone(), Ok(content)))
+                if let Some(content) = quick
+                    && msgs
+                        .send(Msg::Provisional(request.clone(), content))
                         .is_err()
-                    {
+                {
+                    return;
+                }
+                if !still_wanted(&request.path) {
+                    let skipped = Err(io::Error::new(io::ErrorKind::Interrupted, "skipped"));
+                    if msgs.send(Msg::Previewed(request, skipped)).is_err() {
                         return;
                     }
-                    if !still_wanted(&request.path) {
-                        continue;
-                    }
+                    continue;
                 }
                 // A decoder that panics on a malformed file must not take the worker down with it.
                 let result = std::panic::catch_unwind(|| preview::build(&request.path))
@@ -437,6 +502,29 @@ fn spawn_previewers(msgs: Sender<Msg>, wanted: Wanted) -> Sender<PreviewRequest>
             }
         });
     }
+    tx
+}
+
+/// The file under the cursor and its neighbours, whose previews are still worth reading ahead.
+type Nearby = Arc<Mutex<Vec<PathBuf>>>;
+
+/// Reads the files next to the cursor while it rests, one at a time, so stepping onto one finds its
+/// preview ready. Files the cursor has moved away from by then are skipped.
+fn spawn_prefetcher(msgs: Sender<Msg>, nearby: Nearby) -> Sender<PreviewRequest> {
+    let (tx, rx) = mpsc::channel::<PreviewRequest>();
+    thread::spawn(move || {
+        while let Ok(request) = rx.recv() {
+            let result = if nearby.lock().unwrap().contains(&request.path) {
+                std::panic::catch_unwind(|| preview::build(&request.path))
+                    .unwrap_or_else(|_| Err(io::Error::other("the file could not be read")))
+            } else {
+                Err(io::Error::new(io::ErrorKind::Interrupted, "skipped"))
+            };
+            if msgs.send(Msg::Previewed(request, result)).is_err() {
+                return;
+            }
+        }
+    });
     tx
 }
 

@@ -13,66 +13,41 @@ pub struct Placed {
     pub width: u16,
 }
 
-/// Places the trailing columns that fit `viewport`, flush left.
-/// Columns before `keep_from` may be dropped from the left. Later ones never are, and when even
-/// they do not fit they share the space equally.
-pub fn place_columns(widths: &[u16], viewport: u16, keep_from: usize) -> Vec<Placed> {
+/// Places every column flush left. When they do not all fit `viewport` they share it equally,
+/// so none of them is ever dropped.
+pub fn place_columns(widths: &[u16], viewport: u16) -> Vec<Placed> {
     if widths.is_empty() {
         return Vec::new();
     }
-    let keep_from = keep_from.min(widths.len() - 1);
-    let span = |from: usize| -> u32 {
-        let n = (widths.len() - from) as u32;
-        widths[from..].iter().map(|&w| u32::from(w)).sum::<u32>() + u32::from(GUTTER) * (n - 1)
-    };
-    let start = (0..=keep_from)
-        .find(|&s| span(s) <= u32::from(viewport))
-        .unwrap_or(keep_from);
-    let kept = &widths[start..];
-    let n = kept.len() as u16;
+    let n = widths.len() as u16;
+    let span = widths.iter().map(|&w| u32::from(w)).sum::<u32>() + u32::from(GUTTER * (n - 1));
+    let fits = span <= u32::from(viewport);
     let cap = (viewport.saturating_sub(GUTTER * (n - 1)) / n).max(1);
-    let fits = span(start) <= u32::from(viewport);
     let mut x = 0;
-    kept.iter()
+    widths
+        .iter()
         .enumerate()
-        .map(|(i, &w)| {
+        .map(|(level, &w)| {
             let width = if fits { w } else { w.min(cap) };
-            let placed = Placed {
-                level: start + i,
-                x,
-                width,
-            };
+            let placed = Placed { level, x, width };
             x += width + GUTTER;
             placed
         })
         .collect()
 }
 
-/// The narrowest a file preview or editor may get before the tree gives up room for it.
+/// The narrowest a file preview or editor may get before the folder columns shrink for it.
 pub const CONTENT_MIN: u16 = 24;
 
-/// Places the directory columns inside `tree_percent` of the width and, when there is a file
-/// preview or editor, gives it everything to the right of them. Its entry is last, at index `dirs.len()`.
-pub fn place(
-    dirs: &[u16],
-    content: bool,
-    viewport: u16,
-    keep_from: usize,
-    tree_percent: u8,
-) -> Vec<Placed> {
-    let share = (u32::from(viewport) * u32::from(tree_percent.clamp(1, 100)) / 100) as u16;
-    // The share limits the ancestors. The focused column and the one after it are shown whole when the screen allows.
-    let keep = keep_from.min(dirs.len().saturating_sub(1));
-    let needed = dirs.get(keep..).map_or(0, |kept| {
-        kept.iter().sum::<u16>() + GUTTER * (kept.len() as u16).saturating_sub(1)
-    });
-    let limit = if content {
+/// Places all the directory columns at their natural widths and, when there is a file preview or
+/// editor, gives it everything to the right of them. Its entry is last, at index `dirs.len()`.
+pub fn place(dirs: &[u16], content: bool, viewport: u16) -> Vec<Placed> {
+    let budget = if content {
         viewport.saturating_sub(GUTTER + CONTENT_MIN)
     } else {
         viewport
     };
-    let budget = share.max(needed).min(limit).max(1);
-    let mut placed = place_columns(dirs, budget, keep_from);
+    let mut placed = place_columns(dirs, budget.max(1));
     if content {
         let x = placed.last().map_or(0, |p| p.x + p.width + GUTTER);
         placed.push(Placed {
@@ -175,7 +150,7 @@ mod tests {
 
     #[test]
     fn columns_are_flush_left_when_they_fit() {
-        let placed = place_columns(&[10, 20], 60, 0);
+        let placed = place_columns(&[10, 20], 60);
         assert_eq!(
             placed,
             [
@@ -194,19 +169,12 @@ mod tests {
     }
 
     #[test]
-    fn leftmost_levels_scroll_off_first() {
-        let placed = place_columns(&[20, 20, 20], 50, 2);
-        assert_eq!(placed.iter().map(|p| p.level).collect::<Vec<_>>(), [1, 2]);
+    fn columns_that_do_not_fit_shrink_instead_of_being_dropped() {
+        let placed = place_columns(&[30, 30, 30], 40);
         assert_eq!(
-            placed[0].x, 0,
-            "the first visible level starts at the left edge"
+            placed.iter().map(|p| p.level).collect::<Vec<_>>(),
+            [0, 1, 2]
         );
-    }
-
-    #[test]
-    fn levels_from_keep_from_are_never_dropped_but_shrink() {
-        let placed = place_columns(&[30, 30, 30], 40, 1);
-        assert_eq!(placed.iter().map(|p| p.level).collect::<Vec<_>>(), [1, 2]);
         let end = placed.last().map(|p| p.x + p.width).unwrap();
         assert!(
             end <= 40,
@@ -266,43 +234,35 @@ mod tests {
     }
 
     #[test]
-    fn the_tree_stays_inside_its_share_and_the_content_takes_the_rest() {
-        let placed = place(&[20, 20, 20], true, 100, 2, 50);
+    fn all_three_folder_columns_stay_whole_past_half_the_screen() {
+        let placed = place(&[30, 30, 30], true, 130);
         let levels: Vec<_> = placed.iter().map(|p| p.level).collect();
-        assert_eq!(levels, [1, 2, 3], "only two folder columns fit in 50 cells");
+        assert_eq!(levels, [0, 1, 2, 3], "the parent is kept as well");
+        assert!(placed[..3].iter().all(|p| p.width == 30), "{placed:?}");
         let content = placed.last().unwrap();
-        assert_eq!(content.x, 20 + GUTTER + 20 + GUTTER);
-        assert_eq!(content.x + content.width, 100);
-        assert!(placed[1].x + placed[1].width <= 50);
+        assert_eq!(content.x, 3 * (30 + GUTTER));
+        assert_eq!(content.x + content.width, 130);
     }
 
     #[test]
-    fn without_content_the_tree_still_keeps_to_its_share() {
-        let placed = place(&[30, 30, 30], false, 100, 2, 50);
-        assert!(placed.iter().all(|p| p.x + p.width <= 50), "{placed:?}");
-        let wide = place(&[30, 30, 30], false, 100, 2, 100);
-        assert_eq!(wide.len(), 3);
+    fn without_content_the_folder_columns_keep_their_natural_widths() {
+        let placed = place(&[30, 30, 30], false, 100);
+        assert_eq!(placed.len(), 3);
+        assert!(placed.iter().all(|p| p.width == 30), "{placed:?}");
     }
 
     #[test]
-    fn the_focused_column_and_its_child_are_never_squeezed_by_the_share() {
-        let placed = place(&[30, 30, 30], true, 100, 1, 30);
-        let levels: Vec<_> = placed.iter().map(|p| p.level).collect();
-        assert_eq!(levels, [1, 2, 3]);
-        assert_eq!((placed[0].width, placed[1].width), (30, 30));
-    }
-
-    #[test]
-    fn a_full_width_tree_still_leaves_the_content_its_minimum() {
-        let placed = place(&[40, 40], true, 100, 1, 100);
+    fn wide_folder_columns_still_leave_the_content_its_minimum() {
+        let placed = place(&[40, 40, 40], true, 100);
+        assert_eq!(placed.len(), 4, "no folder column is dropped");
         let content = placed.last().unwrap();
         assert!(content.width >= CONTENT_MIN, "{placed:?}");
         assert_eq!(content.x + content.width, 100);
     }
 
     #[test]
-    fn short_columns_leave_the_content_more_than_its_share() {
-        let placed = place(&[10], true, 100, 0, 50);
+    fn short_columns_leave_the_content_the_rest() {
+        let placed = place(&[10], true, 100);
         assert_eq!(placed[1].x, 10 + GUTTER);
         assert_eq!(placed[1].width, 100 - 10 - GUTTER);
     }

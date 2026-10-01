@@ -3,7 +3,7 @@
 
 use std::{
     fs::{self, File},
-    io::{self, Read},
+    io::{self, Read, Seek},
     path::Path,
     sync::OnceLock,
     time::SystemTime,
@@ -12,7 +12,7 @@ use std::{
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use chrono::{DateTime, Local};
-use image::ImageDecoder;
+use image::{DynamicImage, GenericImageView, ImageBuffer, ImageDecoder, metadata::Orientation};
 use syntect::{
     easy::HighlightLines,
     highlighting::{Theme, ThemeSet},
@@ -22,6 +22,7 @@ use syntect::{
 
 use crate::{
     imageview::ImageData,
+    rawfile::Embedded,
     theme::{DIM, FG},
 };
 
@@ -129,10 +130,15 @@ pub fn build(path: &Path) -> io::Result<Content> {
     if looks_like_text(&head, cut) {
         return Ok(text_content(&head, cut, meta.len(), path));
     }
-    let is_image = infer::get(&head).is_some_and(|k| k.mime_type().starts_with("image/"));
-    if is_image && meta.len() <= MAX_IMAGE_BYTES {
-        match decode_image(path) {
-            Ok(image) => return Ok(image_content(&head, &meta, image)),
+    // Fuji's raw files are pictures that the type sniffer does not know.
+    let is_image = crate::rawfile::is_raf(&head)
+        || infer::get(&head).is_some_and(|k| k.mime_type().starts_with("image/"));
+    if is_image {
+        match decode_image(path, meta.len()) {
+            Ok((image, facts)) => {
+                let image = ImageData(std::sync::Arc::new(image));
+                return Ok(image_content(&head, &meta, image, facts));
+            }
             Err(e) => {
                 let mut content = binary_content(&head, cut, &meta);
                 content
@@ -246,12 +252,22 @@ pub(crate) fn highlight(source: &[String], path: &Path) -> Vec<Line> {
     out
 }
 
-pub const MAX_IMAGE_BYTES: u64 = 64 * 1024 * 1024;
+/// Decoding a picture bigger than this would hold gigabytes. JPEGs are exempt: they are decoded
+/// scaled down.
+const MAX_PIXELS: u64 = 100_000_000;
 /// Pictures are never kept larger than this on either side.
 const MAX_IMAGE_SIDE: u32 = 2048;
 
 static TARGET_WIDTH: AtomicU32 = AtomicU32::new(MAX_IMAGE_SIDE);
 static TARGET_HEIGHT: AtomicU32 = AtomicU32::new(MAX_IMAGE_SIDE);
+
+/// Loads the syntax definitions and the system's picture codecs, so neither delays the first preview
+/// that needs them. Meant for a thread of its own at startup.
+pub fn warm() {
+    highlighter();
+    #[cfg(target_os = "macos")]
+    crate::imageio::warm();
+}
 
 /// The most pixels a picture is ever shown with, from the terminal size and drawing method.
 /// Pictures are decoded and shrunk to fit this, so a 40 megapixel photo costs no more than the screen.
@@ -366,97 +382,324 @@ fn embedded_preview(head: &[u8]) -> Option<&[u8]> {
     best.map(|(bytes, _)| bytes)
 }
 
-/// Reads a picture's header and decodes the preview the camera stored in it, with the orientation
-/// the photo asks for. About a millisecond, where the real image data costs hundreds.
-fn header_preview(path: &Path) -> Option<(Vec<u8>, image::DynamicImage)> {
+/// The first bytes of a file, where a picture keeps its header and a camera its previews.
+fn read_head(path: &Path) -> Option<Vec<u8>> {
     let mut head = Vec::with_capacity(PREVIEW_SCAN_BYTES as usize);
     File::open(path)
         .ok()?
         .take(PREVIEW_SCAN_BYTES)
         .read_to_end(&mut head)
         .ok()?;
-    // Only JPEG carries these, and scanning anything else is wasted work.
-    if !head.starts_with(b"\xFF\xD8\xFF") {
-        return None;
-    }
-    let mut image = image::load_from_memory(embedded_preview(&head)?).ok()?;
-    // The orientation flag describes the photo, and the preview is stored the same way round.
-    if let Some(orientation) = image::ImageReader::new(io::Cursor::new(&head))
+    Some(head)
+}
+
+const JPEG_START: &[u8] = b"\xFF\xD8\xFF";
+
+/// How a JPEG asks to be turned, read from its header alone.
+fn jpeg_orientation(head: &[u8]) -> Orientation {
+    image::ImageReader::new(io::Cursor::new(head))
         .with_guessed_format()
         .ok()
         .and_then(|r| r.into_decoder().ok())
         .and_then(|mut d| d.orientation().ok())
-    {
-        image.apply_orientation(orientation);
+        .unwrap_or(Orientation::NoTransforms)
+}
+
+fn turns_sideways(orientation: Orientation) -> bool {
+    matches!(
+        orientation,
+        Orientation::Rotate90
+            | Orientation::Rotate270
+            | Orientation::Rotate90FlipH
+            | Orientation::Rotate270FlipH
+    )
+}
+
+/// The box to fit a picture into before it is turned upright, so that it fits `width` by `height` after.
+fn stored_box(orientation: Orientation, width: u32, height: u32) -> (u32, u32) {
+    if turns_sideways(orientation) {
+        (height, width)
+    } else {
+        (width, height)
     }
-    Some((head, image))
+}
+
+/// Decodes the preview the camera stored in a JPEG's header, upright and cut to the photo's shape,
+/// when `wanted` accepts its upright size. About a millisecond, where the real image data costs
+/// hundreds. The size is read before decoding, so a preview that is not wanted costs nothing.
+fn header_preview(
+    head: &[u8],
+    orientation: Orientation,
+    wanted: impl Fn((u32, u32)) -> bool,
+) -> Option<DynamicImage> {
+    let bytes = embedded_preview(head)?;
+    let (w, h) = jpeg_size(bytes)?;
+    if !wanted(stored_box(orientation, w, h)) {
+        return None;
+    }
+    let mut image = image::load_from_memory(bytes).ok()?;
+    if let Some((w, h)) = jpeg_size(head) {
+        image = crop_to_shape(image, w, h);
+    }
+    // The orientation flag describes the photo, and the preview is stored the same way round.
+    image.apply_orientation(orientation);
+    Some(image)
+}
+
+/// Some cameras keep a 4:3 preview of a 3:2 photo, with black bars above and below. Cutting the
+/// bars off keeps the first paint the shape of the photo that replaces it.
+fn crop_to_shape(image: DynamicImage, width: u32, height: u32) -> DynamicImage {
+    let (pw, ph) = (image.width(), image.height());
+    let (w, h) = (u64::from(width.max(1)), u64::from(height.max(1)));
+    let fit_h = (u64::from(pw) * h / w) as u32;
+    let fit_w = (u64::from(ph) * w / h) as u32;
+    // A pixel or two is rounding, not bars.
+    if fit_h > 0 && fit_h + 2 < ph {
+        image.crop_imm(0, (ph - fit_h) / 2, pw, fit_h)
+    } else if fit_w > 0 && fit_w + 2 < pw {
+        image.crop_imm((pw - fit_w) / 2, 0, fit_w, ph)
+    } else {
+        image
+    }
+}
+
+/// Where the JPEG to show sits in a file: the whole of a JPEG, or the finished picture a camera
+/// stored in its raw file.
+fn jpeg_in(path: &Path, head: &[u8], len: u64) -> Option<Embedded> {
+    if head.starts_with(JPEG_START) {
+        return Some(Embedded {
+            offset: 0,
+            len,
+            orientation: None,
+        });
+    }
+    crate::rawfile::locate(path, head, image_target())
+}
+
+/// Up to `most` bytes of `part` of the file.
+fn read_part(path: &Path, part: &Embedded, most: u64) -> io::Result<Vec<u8>> {
+    let mut file = File::open(path)?;
+    file.seek(io::SeekFrom::Start(part.offset))?;
+    let take = part.len.min(most);
+    let mut out = Vec::with_capacity(take as usize);
+    file.take(take).read_to_end(&mut out)?;
+    Ok(out)
+}
+
+/// The first bytes of the embedded JPEG, which are the file's own head when it is a JPEG.
+fn part_head(path: &Path, part: &Embedded, head: &[u8]) -> Option<Vec<u8>> {
+    if part.offset == 0 {
+        return Some(head.to_vec());
+    }
+    read_part(path, part, PREVIEW_SCAN_BYTES).ok()
+}
+
+/// How the picture asks to be turned: a raw says so for its JPEG, a JPEG for itself.
+fn part_orientation(part: &Embedded, head: &[u8]) -> Orientation {
+    part.orientation
+        .and_then(|o| Orientation::from_exif(o as u8))
+        .unwrap_or_else(|| jpeg_orientation(head))
+}
+
+/// What the camera recorded, from the file or else from the JPEG inside it.
+fn facts_of(head: &[u8], part_head: &[u8]) -> Vec<(&'static str, String)> {
+    let facts = photo_facts(head);
+    if facts.is_empty() {
+        photo_facts(part_head)
+    } else {
+        facts
+    }
 }
 
 /// The camera's own preview, shown at once while the real picture is still being decoded. `None`
 /// when the file has no preview, or when it has one big enough that [`build`] is already instant.
 pub fn build_quick(path: &Path) -> Option<Content> {
     let meta = fs::metadata(path).ok()?;
-    if !meta.is_file() || meta.len() > MAX_IMAGE_BYTES {
+    if !meta.is_file() {
         return None;
     }
     let (width, height) = image_target();
-    let (head, image) = header_preview(path)?;
-    if covers((image.width(), image.height()), width, height) {
-        return None;
-    }
+    let head = read_head(path)?;
+    // Only JPEGs carry these, and raws through theirs.
+    let part = jpeg_in(path, &head, meta.len())?;
+    let inner = part_head(path, &part, &head)?;
+    let image = header_preview(&inner, part_orientation(&part, &inner), |size| {
+        !covers(size, width, height)
+    })?;
     let image = ImageData(std::sync::Arc::new(image));
-    Some(image_content(&head, &meta, image))
+    Some(image_content(&head, &meta, image, facts_of(&head, &inner)))
 }
 
-fn decode_image(path: &Path) -> Result<ImageData, String> {
+type Facts = Vec<(&'static str, String)>;
+
+fn decode_image(path: &Path, len: u64) -> Result<(DynamicImage, Facts), String> {
     let (width, height) = image_target();
-    // A preview the camera already made beats decoding forty megapixels, when it is big enough.
-    if let Some((_, image)) = header_preview(path)
-        && covers((image.width(), image.height()), width, height)
+    let head = read_head(path).ok_or("the file could not be read")?;
+    let facts;
+    if let Some(part) = jpeg_in(path, &head, len)
+        && let Some(inner) = part_head(path, &part, &head)
     {
-        return Ok(ImageData(std::sync::Arc::new(
-            image.thumbnail(width, height),
-        )));
-    }
-    let reader = image::ImageReader::open(path)
-        .and_then(|r| r.with_guessed_format())
-        .map_err(|e| e.to_string())?;
-    let is_jpeg = reader.format() == Some(image::ImageFormat::Jpeg);
-    let mut decoder = reader.into_decoder().map_err(|e| e.to_string())?;
-    let orientation = decoder
-        .orientation()
-        .unwrap_or(image::metadata::Orientation::NoTransforms);
-    let scaled = if is_jpeg {
-        decode_jpeg_scaled(path, width, height).ok()
+        facts = facts_of(&head, &inner);
+        match decode_jpeg(path, &part, &inner, width, height) {
+            Ok(image) => return Ok((image, facts)),
+            Err(e) if part.offset == 0 => return Err(e),
+            // A raw whose JPEG cannot be read may still have a picture the image library reads.
+            Err(_) => {}
+        }
     } else {
-        None
-    };
-    let image = match scaled {
-        Some(image) => image,
-        None => {
-            let mut limits = image::Limits::default();
-            limits.max_image_width = Some(20_000);
-            limits.max_image_height = Some(20_000);
-            limits.max_alloc = Some(512 * 1024 * 1024);
-            decoder.set_limits(limits).map_err(|e| e.to_string())?;
-            image::DynamicImage::from_decoder(decoder).map_err(|e| e.to_string())?
+        facts = photo_facts(&head);
+    }
+    Ok((decode_other(path, &head, width, height)?, facts))
+}
+
+fn decode_jpeg(
+    path: &Path,
+    part: &Embedded,
+    head: &[u8],
+    width: u32,
+    height: u32,
+) -> Result<DynamicImage, String> {
+    let orientation = part_orientation(part, head);
+    // A preview the camera already made beats decoding forty megapixels, when it is big enough.
+    if let Some(image) = header_preview(head, orientation, |size| covers(size, width, height)) {
+        return Ok(image.thumbnail(width, height));
+    }
+    let data = read_part(path, part, u64::MAX).map_err(|e| e.to_string())?;
+    // The system decoder scales while it decodes and is about twice as fast as the ones in Rust.
+    #[cfg(target_os = "macos")]
+    {
+        let longest = jpeg_size(head).map_or(width.max(height), |(w, h)| {
+            let (w, h) = stored_box(orientation, w, h);
+            let scale = (f64::from(width) / f64::from(w))
+                .min(f64::from(height) / f64::from(h))
+                .min(1.0);
+            (f64::from(w.max(h)) * scale).round() as u32
+        });
+        if let Some(mut image) = crate::imageio::thumbnail(&data, longest) {
+            // ImageIO turns a picture the way its own header says; a raw's JPEG has no say.
+            if part.orientation.is_some() {
+                image.apply_orientation(orientation);
+            }
+            return Ok(shrink(image, width, height));
+        }
+    }
+    let (bw, bh) = stored_box(orientation, width, height);
+    let image = match decode_jpeg_scaled(&data, bw, bh) {
+        Ok(image) => image,
+        Err(_) => {
+            let reader = image::ImageReader::new(io::Cursor::new(&data))
+                .with_guessed_format()
+                .map_err(|e| e.to_string())?;
+            decode_limited(reader)?.0
         }
     };
-    let mut image = if image.width() > width || image.height() > height {
-        image.thumbnail(width, height)
-    } else {
-        image
-    };
+    let mut image = shrink(image, bw, bh);
     image.apply_orientation(orientation);
-    Ok(ImageData(std::sync::Arc::new(image)))
+    Ok(image)
+}
+
+fn decode_other(path: &Path, head: &[u8], width: u32, height: u32) -> Result<DynamicImage, String> {
+    if let Ok(size) = imagesize::blob_size(head)
+        && size.width as u64 * size.height as u64 > MAX_PIXELS
+    {
+        return Err(format!(
+            "{}×{} px is too big to decode",
+            size.width, size.height
+        ));
+    }
+    let decoded = image::ImageReader::open(path)
+        .and_then(|r| r.with_guessed_format())
+        .map_err(|e| e.to_string())
+        .and_then(decode_limited);
+    match decoded {
+        Ok((image, orientation)) => {
+            let (bw, bh) = stored_box(orientation, width, height);
+            let mut image = shrink(image, bw, bh);
+            image.apply_orientation(orientation);
+            Ok(image)
+        }
+        // HEIC and the like, which the system can read and the image library cannot.
+        #[cfg(target_os = "macos")]
+        Err(e) => fs::read(path)
+            .ok()
+            .and_then(|data| crate::imageio::thumbnail(&data, width.max(height)))
+            .map(|image| shrink(image, width, height))
+            .ok_or(e),
+        #[cfg(not(target_os = "macos"))]
+        Err(e) => Err(e),
+    }
+}
+
+/// The whole picture and the way it asks to be turned, refusing sizes that would exhaust memory.
+fn decode_limited<R: io::BufRead + io::Seek>(
+    reader: image::ImageReader<R>,
+) -> Result<(DynamicImage, Orientation), String> {
+    let mut decoder = reader.into_decoder().map_err(|e| e.to_string())?;
+    let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(20_000);
+    limits.max_image_height = Some(20_000);
+    limits.max_alloc = Some(512 * 1024 * 1024);
+    decoder.set_limits(limits).map_err(|e| e.to_string())?;
+    let image = DynamicImage::from_decoder(decoder).map_err(|e| e.to_string())?;
+    Ok((image, orientation))
+}
+
+/// Shrinks a picture to fit `width` by `height`, keeping its shape, with the averaging filter of
+/// [`DynamicImage::thumbnail`]. Pictures that already fit are left alone.
+pub(crate) fn shrink(image: DynamicImage, width: u32, height: u32) -> DynamicImage {
+    let (iw, ih) = (image.width(), image.height());
+    if iw <= width && ih <= height {
+        return image;
+    }
+    let scale = (f64::from(width) / f64::from(iw)).min(f64::from(height) / f64::from(ih));
+    let w = ((f64::from(iw) * scale).round() as u32).clamp(1, width);
+    let h = ((f64::from(ih) * scale).round() as u32).clamp(1, height);
+    match image {
+        DynamicImage::ImageRgb8(i) => DynamicImage::ImageRgb8(par_thumbnail(&i, w, h)),
+        DynamicImage::ImageRgba8(i) => DynamicImage::ImageRgba8(par_thumbnail(&i, w, h)),
+        DynamicImage::ImageLuma8(i) => DynamicImage::ImageLuma8(par_thumbnail(&i, w, h)),
+        other => other.thumbnail_exact(w, h),
+    }
+}
+
+/// The averaging filter runs on one core, which costs 60 ms for a 24 megapixel PNG. Bands of rows
+/// shrunk side by side cost a few.
+fn par_thumbnail<P>(image: &ImageBuffer<P, Vec<u8>>, w: u32, h: u32) -> ImageBuffer<P, Vec<u8>>
+where
+    P: image::Pixel<Subpixel = u8> + Send + Sync + 'static,
+{
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let bands = (cores as u32).clamp(1, h);
+    let (sw, sh) = image.dimensions();
+    let source_row = |row: u32| (u64::from(row) * u64::from(sh) / u64::from(h)) as u32;
+    let parts: Vec<Vec<u8>> = std::thread::scope(|scope| {
+        let jobs: Vec<_> = (0..bands)
+            .map(|i| {
+                let (top, bottom) = (h * i / bands, h * (i + 1) / bands);
+                let (from, to) = (source_row(top), source_row(bottom));
+                scope.spawn(move || {
+                    image::imageops::thumbnail(
+                        &*image.view(0, from, sw, to - from),
+                        w,
+                        bottom - top,
+                    )
+                    .into_raw()
+                })
+            })
+            .collect();
+        jobs.into_iter()
+            .map(|j| j.join().expect("shrinking a band"))
+            .collect()
+    });
+    ImageBuffer::from_raw(w, h, parts.concat()).expect("the bands make up the picture")
 }
 
 /// Decodes a JPEG straight at a reduced scale (1/2, 1/4 or 1/8), which skips most of the work
 /// for big photos. `None`-worthy formats such as CMYK are left to the general decoder.
-fn decode_jpeg_scaled(path: &Path, width: u32, height: u32) -> Result<image::DynamicImage, String> {
+fn decode_jpeg_scaled(data: &[u8], width: u32, height: u32) -> Result<DynamicImage, String> {
     use jpeg_decoder::PixelFormat;
-    let file = std::io::BufReader::new(File::open(path).map_err(|e| e.to_string())?);
-    let mut decoder = jpeg_decoder::Decoder::new(file);
+    let mut decoder = jpeg_decoder::Decoder::new(data);
     decoder.set_max_decoding_buffer_size(512 * 1024 * 1024);
     let clamp = |v: u32| v.min(u32::from(u16::MAX)) as u16;
     // The codec only divides by 2, 4 or 8 and picks the smallest result at least as big as asked.
@@ -483,7 +726,7 @@ fn decode_jpeg_scaled(path: &Path, width: u32, height: u32) -> Result<image::Dyn
     image.ok_or_else(|| "unsupported pixel layout".to_string())
 }
 
-fn image_content(head: &[u8], meta: &fs::Metadata, image: ImageData) -> Content {
+fn image_content(head: &[u8], meta: &fs::Metadata, image: ImageData, facts: Facts) -> Content {
     let mut lines = vec![
         card("type", &describe_type(head)),
         card("size", &human_size(meta.len())),
@@ -491,10 +734,190 @@ fn image_content(head: &[u8], meta: &fs::Metadata, image: ImageData) -> Content 
     if let Ok(modified) = meta.modified() {
         lines.push(card("modified", &format_time(modified)));
     }
+    lines.extend(facts.into_iter().map(|(key, value)| card(key, &value)));
+    lines.push(Line::default());
+    lines.extend(histogram(&image.0));
     Content {
         image: Some(image),
         lines,
         numbered: false,
+    }
+}
+
+const HISTOGRAM_BINS: usize = 32;
+const HISTOGRAM_ROWS: usize = 4;
+/// Clipping below this share of the pixels is not worth a line.
+const CLIPPED_SHARE: f64 = 0.005;
+
+/// How the brightness of a picture is spread, as bars from shadows on the left to highlights on
+/// the right, and a line when a share of it is pure black or pure white. Counted on the picture
+/// as shown, which has the same shape as the full photo but slightly fewer clipped pixels.
+fn histogram(image: &image::DynamicImage) -> Vec<Line> {
+    let rgb = match image.as_rgb8() {
+        Some(rgb) => std::borrow::Cow::Borrowed(rgb),
+        None => std::borrow::Cow::Owned(image.to_rgb8()),
+    };
+    let mut bins = [0u64; HISTOGRAM_BINS];
+    let (mut dark, mut bright) = (0u64, 0u64);
+    for pixel in rgb.pixels() {
+        let [r, g, b] = pixel.0;
+        let luma = (2126 * u32::from(r) + 7152 * u32::from(g) + 722 * u32::from(b)) / 10_000;
+        bins[luma as usize * HISTOGRAM_BINS / 256] += 1;
+        dark += u64::from(r.max(g).max(b) == 0);
+        bright += u64::from(r.min(g).min(b) == 255);
+    }
+    // The end bins hold the clipped pixels, and a spike there would flatten everything between.
+    let peak = bins[1..HISTOGRAM_BINS - 1]
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(0)
+        .max(1) as f64;
+    const GLYPHS: [char; 9] = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let mut lines: Vec<Line> = (0..HISTOGRAM_ROWS)
+        .map(|row| {
+            let floor = (HISTOGRAM_ROWS - 1 - row) * 8;
+            let bars = bins
+                .iter()
+                .map(|&count| {
+                    let eighths = ((count as f64 / peak).min(1.0) * (HISTOGRAM_ROWS * 8) as f64)
+                        .round() as usize;
+                    GLYPHS[eighths.saturating_sub(floor).min(8)]
+                })
+                .collect::<String>();
+            Line(vec![Span::new(bars, DIM)])
+        })
+        .collect();
+    let total = (rgb.width() as f64 * rgb.height() as f64).max(1.0);
+    let clipped: Vec<String> = [("shadows", dark), ("highlights", bright)]
+        .into_iter()
+        .filter(|(_, count)| *count as f64 / total >= CLIPPED_SHARE)
+        .map(|(side, count)| format!("{side} {:.1}%", count as f64 * 100.0 / total))
+        .collect();
+    if !clipped.is_empty() {
+        lines.push(card("clipped", &clipped.join("  ")));
+    }
+    lines
+}
+
+/// What the camera recorded about a photo: which camera and lens, when, and how it was exposed.
+/// Only the header is read, and a file without these simply has none.
+fn photo_facts(head: &[u8]) -> Facts {
+    use exif::{In, Tag, Value};
+    let Ok(exif) = exif::Reader::new().read_from_container(&mut io::Cursor::new(head)) else {
+        return Vec::new();
+    };
+    let value = |tag| exif.get_field(tag, In::PRIMARY).map(|f| &f.value);
+    let text = |tag| match value(tag)? {
+        Value::Ascii(parts) => {
+            let joined = parts
+                .iter()
+                .map(|p| {
+                    String::from_utf8_lossy(p)
+                        .trim_matches(['\0', ' '])
+                        .to_string()
+                })
+                .filter(|p| !p.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+            (!joined.is_empty()).then_some(joined)
+        }
+        _ => None,
+    };
+    let number = |tag| match value(tag)? {
+        Value::Rational(r) => r.first().filter(|r| r.denom != 0).map(|r| r.to_f64()),
+        other => other.get_uint(0).map(f64::from),
+    };
+    let mut facts = Vec::new();
+
+    let make = text(Tag::Make);
+    let model = text(Tag::Model);
+    let camera = match (make, model) {
+        // Most cameras repeat the maker in the model name.
+        (Some(make), Some(model)) if model.to_lowercase().starts_with(&make.to_lowercase()) => {
+            Some(model)
+        }
+        (Some(make), Some(model)) => Some(format!("{make} {model}")),
+        (make, model) => make.or(model),
+    };
+    facts.extend(camera.map(|c| ("camera", c)));
+    facts.extend(text(Tag::LensModel).map(|l| ("lens", l)));
+    if let Some(taken) = exif.get_field(Tag::DateTimeOriginal, In::PRIMARY) {
+        facts.push(("taken", taken.display_value().to_string()));
+    }
+
+    let mut exposure = Vec::new();
+    if let Some(Value::Rational(r)) = value(Tag::ExposureTime)
+        && let Some(t) = r.first().filter(|t| t.num != 0 && t.denom != 0)
+    {
+        exposure.push(if t.num >= t.denom {
+            format!("{} s", short(t.to_f64()))
+        } else {
+            format!("1/{} s", (f64::from(t.denom) / f64::from(t.num)).round())
+        });
+    }
+    if let Some(f) = number(Tag::FNumber).filter(|f| *f > 0.0) {
+        exposure.push(format!("f/{}", short(f)));
+    }
+    if let Some(iso) = number(Tag::PhotographicSensitivity).filter(|i| *i > 0.0) {
+        exposure.push(format!("ISO {iso}"));
+    }
+    if let Some(focal) = number(Tag::FocalLength).filter(|f| *f > 0.0) {
+        let mut text = format!("{} mm", short(focal));
+        if let Some(full) =
+            number(Tag::FocalLengthIn35mmFilm).filter(|f| *f > 0.0 && (f - focal).abs() >= 1.0)
+        {
+            text.push_str(&format!(" ({full} mm eq.)"));
+        }
+        exposure.push(text);
+    }
+    if !exposure.is_empty() {
+        facts.push(("exposure", exposure.join("  ")));
+    }
+    if value(Tag::Flash)
+        .and_then(|v| v.get_uint(0))
+        .is_some_and(|f| f & 1 == 1)
+    {
+        facts.push(("flash", "fired".to_string()));
+    }
+
+    let degrees = |tag, reference, negative: &str| {
+        let Value::Rational(dms) = value(tag)? else {
+            return None;
+        };
+        let [d, m, s] = dms.get(..3)? else {
+            return None;
+        };
+        if [d, m, s].iter().any(|r| r.denom == 0) {
+            return None;
+        }
+        let deg = d.to_f64() + m.to_f64() / 60.0 + s.to_f64() / 3600.0;
+        let side = text(reference).unwrap_or_default();
+        Some((deg, side.eq_ignore_ascii_case(negative)))
+    };
+    if let (Some((lat, south)), Some((lon, west))) = (
+        degrees(Tag::GPSLatitude, Tag::GPSLatitudeRef, "S"),
+        degrees(Tag::GPSLongitude, Tag::GPSLongitudeRef, "W"),
+    ) {
+        facts.push((
+            "location",
+            format!(
+                "{lat:.5}° {}, {lon:.5}° {}",
+                if south { "S" } else { "N" },
+                if west { "W" } else { "E" }
+            ),
+        ));
+    }
+    facts
+}
+
+/// A number with at most one decimal, and none when it is whole: 2.8, 8, 0.5.
+fn short(value: f64) -> String {
+    let rounded = (value * 10.0).round() / 10.0;
+    if rounded.fract() == 0.0 {
+        format!("{rounded:.0}")
+    } else {
+        format!("{rounded:.1}")
     }
 }
 
@@ -538,6 +961,7 @@ fn describe_type(head: &[u8]) -> String {
     let mut parts = Vec::new();
     match infer::get(head) {
         Some(kind) => parts.push(format!("{} ({})", kind.mime_type(), kind.extension())),
+        None if crate::rawfile::is_raf(head) => parts.push("Fujifilm raw (raf)".to_string()),
         None => parts.push("unknown binary data".to_string()),
     }
     if let Ok(size) = imagesize::blob_size(head) {
@@ -1077,5 +1501,127 @@ mod tests {
             "{:?}",
             text(&content)
         );
+    }
+
+    fn png_with_exif(fields: &[exif::Field]) -> Vec<u8> {
+        use image::ImageEncoder;
+        let mut writer = exif::experimental::Writer::new();
+        for field in fields {
+            writer.push_field(field);
+        }
+        let mut tiff = std::io::Cursor::new(Vec::new());
+        writer.write(&mut tiff, false).unwrap();
+        let mut out = Vec::new();
+        let mut encoder = image::codecs::png::PngEncoder::new(&mut out);
+        encoder.set_exif_metadata(tiff.into_inner()).unwrap();
+        let pixels = vec![128u8; 16 * 8 * 3];
+        encoder
+            .write_image(&pixels, 16, 8, image::ExtendedColorType::Rgb8)
+            .unwrap();
+        out
+    }
+
+    #[test]
+    fn a_photo_card_says_which_camera_took_it_and_how() {
+        use exif::{Field, In, Rational, Tag, Value};
+        let field = |tag, value| Field {
+            tag,
+            ifd_num: In::PRIMARY,
+            value,
+        };
+        let ascii = |s: &str| Value::Ascii(vec![s.as_bytes().to_vec()]);
+        let rational = |num, denom| Value::Rational(vec![Rational { num, denom }]);
+        let dms = |d, m, s| {
+            Value::Rational(vec![
+                Rational { num: d, denom: 1 },
+                Rational { num: m, denom: 1 },
+                Rational { num: s, denom: 100 },
+            ])
+        };
+        let (_t, path) = file(
+            "shot.png",
+            &png_with_exif(&[
+                field(Tag::Make, ascii("FUJIFILM")),
+                field(Tag::Model, ascii("X-T5")),
+                field(Tag::LensModel, ascii("XF35mmF1.4 R")),
+                field(Tag::DateTimeOriginal, ascii("2026:05:01 18:04:09")),
+                field(Tag::ExposureTime, rational(1, 250)),
+                field(Tag::FNumber, rational(28, 10)),
+                field(Tag::PhotographicSensitivity, Value::Short(vec![400])),
+                field(Tag::FocalLength, rational(35, 1)),
+                field(Tag::FocalLengthIn35mmFilm, Value::Short(vec![53])),
+                field(Tag::Flash, Value::Short(vec![0x10])),
+                field(Tag::GPSLatitudeRef, ascii("N")),
+                field(Tag::GPSLatitude, dms(52, 13, 4700)),
+                field(Tag::GPSLongitudeRef, ascii("W")),
+                field(Tag::GPSLongitude, dms(21, 0, 3600)),
+            ]),
+        );
+        let lines = text(&build(&path).unwrap());
+        let row = |key: &str| {
+            lines
+                .iter()
+                .find(|l| l.starts_with(key))
+                .unwrap_or_else(|| panic!("no {key} in {lines:#?}"))
+                .clone()
+        };
+        assert_eq!(row("camera"), "camera   FUJIFILM X-T5");
+        assert_eq!(row("lens"), "lens     XF35mmF1.4 R");
+        assert_eq!(row("taken"), "taken    2026-05-01 18:04:09");
+        assert_eq!(
+            row("exposure"),
+            "exposure 1/250 s  f/2.8  ISO 400  35 mm (53 mm eq.)"
+        );
+        assert_eq!(row("location"), "location 52.22972° N, 21.01000° W");
+        assert!(
+            !lines.iter().any(|l| l.starts_with("flash")),
+            "a flash that did not fire is not worth a line"
+        );
+    }
+
+    #[test]
+    fn a_picture_without_camera_data_keeps_the_short_card() {
+        let (_t, path) = file("pic.png", &png(64, 32));
+        let lines = text(&build(&path).unwrap());
+        assert!(
+            !lines.iter().any(|l| ["camera", "exposure", "taken"]
+                .iter()
+                .any(|k| l.starts_with(k))),
+            "{lines:#?}"
+        );
+    }
+
+    #[test]
+    fn a_picture_gets_a_brightness_histogram_and_says_what_is_clipped() {
+        let img = image::RgbImage::from_fn(48, 8, |x, _| match x {
+            0..16 => image::Rgb([0, 0, 0]),
+            16..32 => image::Rgb([128, 128, 128]),
+            _ => image::Rgb([255, 255, 255]),
+        });
+        let lines = text(&Content {
+            lines: histogram(&image::DynamicImage::ImageRgb8(img)),
+            image: None,
+            numbered: false,
+        });
+        assert_eq!(lines.len(), HISTOGRAM_ROWS + 1, "{lines:#?}");
+        for bars in &lines[..HISTOGRAM_ROWS] {
+            let bars: Vec<char> = bars.chars().collect();
+            assert_eq!(bars.len(), HISTOGRAM_BINS);
+            assert_eq!(bars[0], '█', "black at the far left: {lines:#?}");
+            assert_eq!(bars[HISTOGRAM_BINS / 2], '█', "grey in the middle");
+            assert_eq!(bars[HISTOGRAM_BINS - 1], '█', "white at the far right");
+            assert_eq!(bars.iter().filter(|c| **c != ' ').count(), 3, "{lines:#?}");
+        }
+        assert_eq!(
+            lines[HISTOGRAM_ROWS],
+            "clipped  shadows 33.3%  highlights 33.3%"
+        );
+    }
+
+    #[test]
+    fn a_picture_without_clipped_pixels_has_no_clipping_line() {
+        let img = image::RgbImage::from_pixel(8, 8, image::Rgb([100, 150, 200]));
+        let lines = histogram(&image::DynamicImage::ImageRgb8(img));
+        assert_eq!(lines.len(), HISTOGRAM_ROWS);
     }
 }
